@@ -1,0 +1,19 @@
+# FR-01 crate 分层与数据边界 (mode: grep, 零 LLM)
+# 规则: mock 数据只放 crates/admin-web/mock/, 面板禁止直接 use mock::
+#      (除 api.rs 薄壳外)
+# 检测: grep -rEn 'use mock::|mock::' crates/admin-web/page-*/src/ 排除 api.rs 应无结果
+enabled: true
+hooks: [pre-commit, pre-push, merge]
+sla: l1
+fail_severity: FAIL
+match:
+  paths_include: ["**/*.rs"]
+  paths_exclude: ["target/", ".wt/"]
+mode: grep
+harness:
+  command: "sh"
+  args:
+    - "-c"
+    - "ROOT=$(git rev-parse --show-toplevel); matches=$(grep -rEn 'use mock::|mock::' \"$ROOT/crates/admin-web\"/page-*/src/ --include='*.rs' 2>/dev/null | grep -v 'src/api.rs:' | head -20); if [ -z \"$matches\" ]; then echo '[]'; else printf '%s' \"$matches\" | jq -R -s 'split(\"\\n\") | map(select(length>0)) | map(capture(\"^(?<path>.+):(?<line>[0-9]+):(?<rest>.*)$\")) | map({id: \"FR01-MOCK\", severity: \"FAIL\", path: .path, line: (.line|tonumber), message: (\"面板直接引用 mock: \" + .rest)})'; fi"
+optional: true
+timeout: 10

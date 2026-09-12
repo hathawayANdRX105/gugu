@@ -1,0 +1,62 @@
+name: Gateway Bench (Remote Server)
+
+on:
+  push:
+    branches:
+      - feat/gateway-bench
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Benchmark scenario (baseline, medium_load, multi_model, streaming, stress, all)"
+        required: false
+        default: "baseline"
+
+jobs:
+  bench:
+    name: Run Benchmark on Remote Server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Secrets
+        env:
+          HOST: ${{ secrets.BENCH_SERVER_HOST }}
+          USER: ${{ secrets.BENCH_SERVER_USER }}
+          SSH_KEY: ${{ secrets.BENCH_SSH_PRIVATE_KEY }}
+        run: |
+          missing=()
+          [ -z "$HOST" ] && missing+=("BENCH_SERVER_HOST")
+          [ -z "$USER" ] && missing+=("BENCH_SERVER_USER")
+          [ -z "$SSH_KEY" ] && missing+=("BENCH_SSH_PRIVATE_KEY")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing required Secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "Target server: $USER@$HOST"
+
+      - name: Configure SSH Key
+        env:
+          HOST: ${{ secrets.BENCH_SERVER_HOST }}
+          SSH_KEY: ${{ secrets.BENCH_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/bench_key
+          chmod 600 ~/.ssh/bench_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Verify Remote Server Connection
+        env:
+          HOST: ${{ secrets.BENCH_SERVER_HOST }}
+          USER: ${{ secrets.BENCH_SERVER_USER }}
+        run: |
+          echo "=== Verifying Passwordless SSH Access ==="
+          ssh -i ~/.ssh/bench_key "$USER@$HOST" bash -s << 'REMOTE'
+            echo "Successfully logged into: $(hostname)"
+            echo "Kernel: $(uname -sr)"
+            echo "Docker containers:"
+            docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | head -6
+          REMOTE
+          echo "SSH verification PASSED!"

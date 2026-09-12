@@ -1,1 +1,12 @@
 /target
+todo/
+data/
+.env
+.env.*
+*.pem
+*.key
+
+# reference tooling caches
+.codegraph/
+.code-review-graph/
+node_modules/
