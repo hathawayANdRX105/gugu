@@ -1,0 +1,18 @@
+[package]
+name = "gugu"
+version = "0.1.0"
+edition = "2021"
+description = "gugu 咕咕 — lightweight QQ chat client (Slint, software renderer)"
+
+[dependencies]
+slint = { version = "1.17", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
+image = { version = "0.25", default-features = false, features = ["gif", "png"] }
+
+[build-dependencies]
+slint-build = "1.17"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

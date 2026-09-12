@@ -1,0 +1,137 @@
+// 咕咕 gugu — Discord-like chat UI (Slint, software renderer)
+// Layout: left channel list | right message scroll + input bar.
+// Animated stickers: Rust decodes GIF frames and drives `frame-index`.
+
+import { LineEdit, Button, ScrollView } from "std-widgets.slint";
+
+export struct Channel {
+    name: string,
+}
+
+export struct Message {
+    author: string,
+    initial: string,     // avatar letter, computed in Rust (no substring in slint)
+    body: string,
+    time: string,
+    color: int,          // avatar palette index
+    sticker: image,      // empty image = no sticker; Rust drives gif frames
+}
+
+// A single chat message row: [avatar] [name+time / body].
+component MessageRow inherits Rectangle {
+    in property <Message> msg;
+    in property <length> sticker-size: 120px;
+
+    private property <[color]> palette: [
+        #c0392b, #2980b9, #27ae60, #8e44ad,
+        #f0932b, #d81b60, #16a085, #008b8b
+    ];
+
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 12px;
+        padding-top: 6px; padding-bottom: 6px;
+        spacing: 8px;
+
+        // avatar: solid circle + initial letter
+        Rectangle {
+            width: 34px; height: 34px; border-radius: 17px;
+            background: palette[Math.mod(msg.color, 8)];
+            Text {
+                text: msg.initial;
+                color: white; font-size: 16px; font-weight: 600;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+
+        VerticalLayout {
+            alignment: stretch; spacing: 2px;
+            HorizontalLayout {
+                spacing: 6px;
+                Text { text: msg.author; color: #8292a2; font-size: 13px; font-weight: 700; }
+                Text { text: msg.time;  color: #72767d; font-size: 11px; }
+            }
+            Text {
+                text: msg.body;
+                color: #dbdee1;
+                font-size: 14px;
+                wrap: word-wrap;
+                width: 100%;
+            }
+            // animated sticker slot: frame image driven from Rust (gif loop)
+            Image {
+                visible: msg.sticker.width > 0;
+                width: sticker-size; height: sticker-size;
+                image-fit: contain;
+                source: msg.sticker;
+            }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "咕咕 gugu";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    background: #1e1f22;
+
+    in property <[Channel]> channels;
+    in property <int> selected: 0;
+    in property <[Message]> messages;
+    in-out property <string> draft: "";
+    callback send();
+    callback select-channel(index: int);
+
+    HorizontalLayout {
+        // ---- sidebar ----
+        Rectangle {
+            width: 200px;
+            background: #2b2d31;
+            VerticalLayout {
+                padding: 8px; spacing: 2px;
+                Text { text: "咕咕"; color: #dcddde; font-size: 16px; font-weight: 700; }
+                for ch[idx] in channels: TouchArea {
+                    height: 34px;
+                    clicked => { root.select-channel(idx); }
+                    Rectangle {
+                        width: parent.width; height: parent.height;
+                        border-radius: 4px;
+                        background: root.selected == idx ? #40444b : transparent;
+                        Text {
+                            text: ch.name;
+                            color: root.selected == idx ? white : #8292a2;
+                            font-size: 14px; font-weight: 600;
+                            vertical-alignment: center;
+                            x: 8px;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- main ----
+        VerticalLayout {
+            spacing: 0px;
+            ScrollView {
+                VerticalLayout {
+                    spacing: 2px;
+                    for msg in messages: MessageRow { msg: msg; }
+                }
+            }
+            Rectangle {
+                height: 52px;
+                background: #3f4147;
+                HorizontalLayout {
+                    padding: 8px; spacing: 8px;
+                    LineEdit {
+                        text <=> root.draft;
+                        placeholder-text: "说点什么…";
+                    }
+                    Button {
+                        text: "发送";
+                        clicked => { root.send(); }
+                    }
+                }
+            }
+        }
+    }
+}
