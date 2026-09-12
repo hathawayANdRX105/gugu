@@ -5,9 +5,7 @@
 // the current frame into the model row. ponytail: one timer for the demo;
 // batch per-sticker timers when real chat has many gifs on screen.
 
-use slint::{
-    ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel,
-};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -38,7 +36,12 @@ fn color_of(name: &str) -> i32 {
 
 /// Minutes since midnight (UTC); mock-clock granularity, one minute.
 fn now_minutes() -> i64 {
-    (SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() / 60 % 1440) as i64
+    (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60
+        % 1440) as i64
 }
 
 /// Format minutes since midnight as "HH:MM".
@@ -99,7 +102,12 @@ fn main() -> Result<(), slint::PlatformError> {
         ("bob", "牛啊", 20 * 60 + 4, false),
         ("bob", "我本地跑了一下午没复现", 20 * 60 + 5, false),
         ("carol", "能发了吗", 20 * 60 + 7, false),
-        ("alice", "同一个人隔了 20 分钟，重开一组", 20 * 60 + 20, false),
+        (
+            "alice",
+            "同一个人隔了 20 分钟，重开一组",
+            20 * 60 + 20,
+            false,
+        ),
         ("bob", "看这个贴纸", 20 * 60 + 24, true),
         ("dave", "哈哈哈有点可爱", 20 * 60 + 25, false),
         ("erin", "下午三点会议室过一版", 20 * 60 + 29, false),
@@ -150,7 +158,9 @@ fn main() -> Result<(), slint::PlatformError> {
             return;
         }
         let min = now_minutes();
-        let grouped = last_send.borrow().is_some_and(|(a, m)| a == "you" && min - m <= 5);
+        let grouped = last_send
+            .borrow()
+            .is_some_and(|(a, m)| a == "you" && min - m <= 5);
         model_send.push(Message {
             author: "you".into(),
             initial: initial("you"),
@@ -179,16 +189,20 @@ fn main() -> Result<(), slint::PlatformError> {
     let state_c = state.clone();
     let model_c = model.clone();
     let timer_c = timer.clone();
-    timer.start(TimerMode::Repeated, Duration::from_millis(gif.delays[0]), move || {
-        let gif = gif_c.clone();
-        let i = *state_c.borrow();
-        let mut m = model_c.row_data(sticker_row).unwrap();
-        m.sticker = gif.frames[i].clone();
-        model_c.set_row_data(sticker_row, m);
-        let next = (i + 1) % gif.frames.len();
-        *state_c.borrow_mut() = next;
-        timer_c.set_interval(Duration::from_millis(gif.delays[next]));
-    });
+    timer.start(
+        TimerMode::Repeated,
+        Duration::from_millis(gif.delays[0]),
+        move || {
+            let gif = gif_c.clone();
+            let i = *state_c.borrow();
+            let mut m = model_c.row_data(sticker_row).unwrap();
+            m.sticker = gif.frames[i].clone();
+            model_c.set_row_data(sticker_row, m);
+            let next = (i + 1) % gif.frames.len();
+            *state_c.borrow_mut() = next;
+            timer_c.set_interval(Duration::from_millis(gif.delays[next]));
+        },
+    );
 
     ui.run()
 }

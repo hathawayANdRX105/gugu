@@ -9,12 +9,12 @@
 #[path = "../src/stickers.rs"]
 mod stickers;
 
-use image::{Delay, Frame};
 use image::codecs::gif::GifEncoder;
 use image::RgbaImage;
-use stickers::{load_gif, scan_packs, StickerError};
+use image::{Delay, Frame};
 use std::fs;
 use std::path::{Path, PathBuf};
+use stickers::{load_gif, scan_packs, StickerError};
 
 /// Fresh scratch directory under the system temp dir; the only place tests
 /// are allowed to create (and later delete) files.
@@ -69,14 +69,23 @@ fn garbage_or_missing_gif_yields_typed_error_not_panic() {
     fs::write(&bad, b"GIF89a\xff\x00not really a gif at all").unwrap();
     let err = load_gif(&bad).expect_err("garbage must not decode");
     assert!(
-        matches!(err, StickerError::Decode { .. } | StickerError::Empty { .. }),
+        matches!(
+            err,
+            StickerError::Decode { .. } | StickerError::Empty { .. }
+        ),
         "unexpected variant: {err:?}"
     );
-    assert!(err.to_string().contains("broken.gif"), "error should name the file");
+    assert!(
+        err.to_string().contains("broken.gif"),
+        "error should name the file"
+    );
 
     let missing = dir.join("nope.gif");
     let err = load_gif(&missing).expect_err("missing file must error");
-    assert!(matches!(err, StickerError::Io { .. }), "unexpected: {err:?}");
+    assert!(
+        matches!(err, StickerError::Io { .. }),
+        "unexpected: {err:?}"
+    );
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -142,8 +151,14 @@ fn scan_packs_ordering_is_deterministic() {
     assert_eq!(
         shape(&once),
         vec![
-            ("alpha".to_string(), vec!["b.gif".to_string(), "m.gif".to_string()]),
-            ("beta".to_string(), vec!["a.gif".to_string(), "z.gif".to_string()]),
+            (
+                "alpha".to_string(),
+                vec!["b.gif".to_string(), "m.gif".to_string()]
+            ),
+            (
+                "beta".to_string(),
+                vec!["a.gif".to_string(), "z.gif".to_string()]
+            ),
         ]
     );
 
