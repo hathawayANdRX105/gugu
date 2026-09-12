@@ -22,8 +22,8 @@ body:
       label: Done when
       description: 可观测的验收标准，用 `- [ ]` 勾选项
       placeholder: |
-        - [ ] `cargo test -p config` 通过
-        - [ ] 坏配置被拒绝且错误含行号
+        - [ ] `cargo test` 通过
+        - [ ] 坏 gif 文件兜底显示首帧，不 panic
     validations:
       required: true
   - type: textarea

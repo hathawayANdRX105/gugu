@@ -32,5 +32,4 @@ Related #
 - [ ] diff 聚焦，无密钥与生成物
 - [ ] `cargo fmt --all --check` 通过
 - [ ] `cargo clippy --all-targets -- -D warnings` 无告警
-- [ ] `cargo test --all` 通过
-- [ ] `./scripts/check-purity.sh` 通过
+- [ ] `cargo test` 通过（CI 跑，本地不跑）

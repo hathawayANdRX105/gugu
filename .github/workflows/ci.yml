@@ -1,3 +1,8 @@
+# gugu CI
+#
+# 项目策略：所有测试只在 CI 跑，开发机不跑（本地只 `cargo check` 验证编译）。
+# 想验证行为改动 -> 把测试写进 src/tests/ 并推送，这里会跑。
+
 name: CI
 
 on:
@@ -10,7 +15,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# 最小权限：全部 job 只需读 checkout（构建/测试不写仓库，评论由本地 gate 工具发）
+# 最小权限：构建/测试不写仓库
 permissions:
   contents: read
 
@@ -26,80 +31,58 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Run rustfmt
-        run: cargo fmt --all --check
+      - run: cargo fmt --all --check
 
   clippy:
-    name: Clippy Linter
+    name: Clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install system deps (Slint winit/X11)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            pkg-config
       - uses: Swatinem/rust-cache@v2
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
 
-  # PR：按 git diff 的 path scope 只跑受影响的包，快速反馈。
-  dynamic-test:
-    name: Dynamic Crate Check & Test
-    if: github.event_name == 'pull_request'
+  build:
+    name: Build
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run Affected Crates Tests
-        run: bash scripts/ci-affected.sh --base "origin/${{ github.base_ref }}"
-
-  # 合并到 main：跑全量，作为动态选包的兜底。
-  full-test:
-    name: Full Workspace Test
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build all targets
-        run: cargo build --all-targets
-
-      - name: Test all
-        run: cargo test --all
-
-  # gateway-proxy 的 feature 门编译验证：
-  # - utls：uTLS 走 meow-config/boring-tls，需要 BoringSSL（系统 cmake 编译），
-  #   平时 CI 不覆盖，改到 TLS 接线时靠这个 job 兜底。
-  # - no-default-features：协议 feature 全关的极端配置，验证 feature 门没漏。
-  proxy-feature-matrix:
-    name: Proxy Feature Matrix (utls / minimal)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps (Slint winit/X11)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            pkg-config
       - uses: Swatinem/rust-cache@v2
-      - name: Install cmake (BoringSSL build requirement)
-        run: sudo apt-get update && sudo apt-get install -y cmake
-      - name: Check with utls feature
-        run: cargo check -p gateway-proxy --features utls
-      - name: Check with no default features
-        run: cargo check -p gateway-proxy --no-default-features
+      - run: cargo build --all-targets
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps (Slint winit/X11)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libfontconfig1-dev libfreetype6-dev \
+            pkg-config
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test
