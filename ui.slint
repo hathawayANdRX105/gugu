@@ -51,6 +51,16 @@ export struct Message {
     grouped: bool,     // continuation of same author's group: body-only row, indented
 }
 
+// One grid cell of the sticker picker: precomputed first-frame thumbnail
+// plus its (row, col) in the nine-grid — no division/math in .slint.
+export struct StickerCell {
+    image: image,
+    pack: int,
+    index: int,
+    row: int,
+    col: int,
+}
+
 // One chat message. Head row: avatar + name + time + body.
 // Grouped row: no avatar/name, indented so bodies align with the head row's body.
 component MessageRow inherits Rectangle {
@@ -115,8 +125,15 @@ export component MainWindow inherits Window {
     in property <[Message]> messages;
     in-out property <string> draft: "";
     in-out property <bool> show-members: true;
+    in-out property <bool> show-stickers: false;
+    in property <[string]> pack-names;
+    in property <[StickerCell]> sticker-cells;
+    in property <length> grid-height;
+    in-out property <int> current-pack: 0;
     callback send();
     callback select-channel(index: int);
+    callback select-pack(index: int);
+    callback pick-sticker(pack: int, index: int);
 
     HorizontalLayout {
         spacing: 0;
@@ -224,6 +241,63 @@ export component MainWindow inherits Window {
                         for msg in messages: MessageRow { msg: msg; }
                     }
                 }
+                // ---- sticker picker panel (M3): nine-grid above the input bar ----
+                if root.show-stickers: Rectangle {
+                    height: 224px;
+                    background: Palette.side;
+                    VerticalLayout { padding: 6px; spacing: 6px;
+                        if root.pack-names.length > 1: HorizontalLayout {
+                            spacing: 6px; alignment: start;
+                            for pk[idx] in pack-names: Button {
+                                text: root.current-pack == idx ? "■ " + pk : pk;
+                                clicked => {
+                                    root.current-pack = idx;
+                                    root.select-pack(idx);
+                                }
+                            }
+                        }
+                        if root.sticker-cells.length == 0: Rectangle {
+                            height: 160px; // VerticalLayout child needs a height
+                            Text {
+                                text: "没有表情包";
+                                color: Palette.muted; font-size: 14px;
+                                horizontal-alignment: center; vertical-alignment: center;
+                                width: 100%; height: 100%;
+                            }
+                        }
+                        ScrollView {
+                            Rectangle {
+                                height: root.grid-height;
+                                for cell in sticker-cells: Rectangle {
+                                    x: cell.col * 72px; y: cell.row * 72px;
+                                    width: 72px; height: 72px;
+                                    // Keyboard access (a11y basics): Tab focuses a
+                                    // cell, Enter sends it — same path as the click.
+                                    cell-focus := FocusScope {
+                                        key-pressed(event) => {
+                                            if (event.text == Key.Return) {
+                                                root.pick-sticker(cell.pack, cell.index);
+                                                accept
+                                            } else {
+                                                reject
+                                            }
+                                        }
+                                    }
+                                    border-width: cell-focus.has-focus ? 2px : 0px;
+                                    border-color: Palette.accent;
+                                    TouchArea {
+                                        clicked => { root.pick-sticker(cell.pack, cell.index); }
+                                    }
+                                    Image {
+                                        x: 4px; y: 4px; width: 64px; height: 64px;
+                                        image-fit: contain;
+                                        source: cell.image;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 Rectangle {
                     height: 1px; background: Palette.header;
@@ -236,6 +310,10 @@ export component MainWindow inherits Window {
                         LineEdit {
                             text <=> root.draft;
                             placeholder-text: "说点什么…";
+                        }
+                        Button {
+                            text: "表情";
+                            clicked => { root.show-stickers = !root.show-stickers; }
                         }
                         Button {
                             text: "发送";
