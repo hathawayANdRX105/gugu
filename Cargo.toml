@@ -7,6 +7,7 @@ description = "gugu 咕咕 — lightweight QQ chat client (Slint, software rende
 [dependencies]
 slint = { version = "1.17", default-features = false, features = ["std", "backend-winit", "renderer-software", "compat-1-2"] }
 image = { version = "0.25", default-features = false, features = ["gif", "png"] }
+ricq = { git = "https://github.com/hathawayANdRX105/ricq.git", branch = "edition-2024" }
 
 [build-dependencies]
 slint-build = "1.17"
