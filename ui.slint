@@ -1,41 +1,73 @@
-// 咕咕 gugu — Discord-like chat UI (Slint, software renderer)
-// Layout: left channel list | right message scroll + input bar.
-// Animated stickers: Rust decodes GIF frames and drives `frame-index`.
+// 咕咕 gugu — Revolt-style three-pane chat UI (Slint, software renderer)
+// Layout: server rail | channel sidebar | chat (header + messages + input) | collapsible members.
+// Animated stickers: Rust decodes GIF frames and drives the model row (no native gif, #2081).
+// Palette refined from revite dark preset (revite/src/context/Theme.tsx), accent = blurple.
 
 import { LineEdit, Button, ScrollView } from "std-widgets.slint";
 
+// Near-black base, slightly lighter panels, blurple accent.
+global Palette {
+    out property <[color]> avatars: [
+        #c0392b, #2980b9, #27ae60, #8e44ad,
+        #f0932b, #d81b60, #16a085, #008b8b
+    ];
+    out property <color> rail: #101010;
+    out property <color> side: #1e1e1e;
+    out property <color> chat: #242424;
+    out property <color> header: #2b2b2b;
+    out property <color> input: #363636;
+    out property <color> text: #f6f6f6;
+    out property <color> text-secondary: #c8c8c8;
+    out property <color> muted: #848484;
+    out property <color> body: #dbdee1;
+    out property <color> accent: #5865f2;
+    out property <color> selected: #5865f226; // blurple @ ~15%
+}
+
+export struct Server {
+    name: string,
+    initial: string,   // first char uppercased, computed in Rust (no substring in slint)
+    color: int,        // avatar palette index
+}
+
 export struct Channel {
     name: string,
+    header: bool,      // section label row, not selectable
+}
+
+export struct Member {
+    name: string,
+    initial: string,
+    color: int,
 }
 
 export struct Message {
     author: string,
-    initial: string,     // avatar letter, computed in Rust (no substring in slint)
+    initial: string,
     body: string,
     time: string,
-    color: int,          // avatar palette index
-    sticker: image,      // empty image = no sticker; Rust drives gif frames
+    color: int,
+    sticker: image,    // empty image = no sticker; Rust drives gif frames
+    grouped: bool,     // continuation of same author's group: body-only row, indented
 }
 
-// A single chat message row: [avatar] [name+time / body].
+// One chat message. Head row: avatar + name + time + body.
+// Grouped row: no avatar/name, indented so bodies align with the head row's body.
 component MessageRow inherits Rectangle {
     in property <Message> msg;
     in property <length> sticker-size: 120px;
-
-    private property <[color]> palette: [
-        #c0392b, #2980b9, #27ae60, #8e44ad,
-        #f0932b, #d81b60, #16a085, #008b8b
-    ];
+    vertical-stretch: 0; // otherwise the scroll viewport stretches rows to fill it
 
     HorizontalLayout {
-        padding-left: 12px; padding-right: 12px;
-        padding-top: 6px; padding-bottom: 6px;
+        padding-left: msg.grouped ? 54px : 12px; // 12 + avatar 34 + spacing 8
+        padding-right: 12px;
+        padding-top: msg.grouped ? 1px : 7px;
+        padding-bottom: 3px;
         spacing: 8px;
 
-        // avatar: solid circle + initial letter
-        Rectangle {
+        if !msg.grouped: Rectangle {
             width: 34px; height: 34px; border-radius: 17px;
-            background: palette[Math.mod(msg.color, 8)];
+            background: Palette.avatars[Math.mod(msg.color, 8)];
             Text {
                 text: msg.initial;
                 color: white; font-size: 16px; font-weight: 600;
@@ -45,21 +77,22 @@ component MessageRow inherits Rectangle {
 
         VerticalLayout {
             alignment: stretch; spacing: 2px;
-            HorizontalLayout {
-                spacing: 6px;
-                Text { text: msg.author; color: #8292a2; font-size: 13px; font-weight: 700; }
-                Text { text: msg.time;  color: #72767d; font-size: 11px; }
+            if !msg.grouped: HorizontalLayout {
+                spacing: 6px; alignment: start;
+                Text { text: msg.author; color: Palette.text; font-size: 13px; font-weight: 700; }
+                Text { text: msg.time;  color: Palette.muted; font-size: 11px; }
             }
             Text {
                 text: msg.body;
-                color: #dbdee1;
+                color: Palette.body;
                 font-size: 14px;
                 wrap: word-wrap;
                 width: 100%;
             }
-            // animated sticker slot: frame image driven from Rust (gif loop)
-            Image {
-                visible: msg.sticker.width > 0;
+            // animated sticker slot: frame image driven from Rust (gif loop).
+            // Conditional element: an invisible Image would still claim its
+            // 120px cell in the layout and stretch every plain row.
+            if msg.sticker.width > 0: Image {
                 width: sticker-size; height: sticker-size;
                 image-fit: contain;
                 source: msg.sticker;
@@ -72,63 +105,178 @@ export component MainWindow inherits Window {
     title: "咕咕 gugu";
     preferred-width: 1000px;
     preferred-height: 700px;
-    background: #1e1f22;
+    background: Palette.chat;
 
+    in property <[Server]> servers;
     in property <[Channel]> channels;
-    in property <int> selected: 0;
+    private property <int> selected-server: 0; // rail selection is view-only state
+    in property <int> selected;
+    in property <[Member]> members;
     in property <[Message]> messages;
     in-out property <string> draft: "";
+    in-out property <bool> show-members: true;
     callback send();
     callback select-channel(index: int);
 
     HorizontalLayout {
-        // ---- sidebar ----
+        spacing: 0;
+
+        // ---- server rail ----
         Rectangle {
-            width: 200px;
-            background: #2b2d31;
+            width: 56px;
+            background: Palette.rail;
             VerticalLayout {
-                padding: 8px; spacing: 2px;
-                Text { text: "咕咕"; color: #dcddde; font-size: 16px; font-weight: 700; }
-                for ch[idx] in channels: TouchArea {
-                    height: 34px;
-                    clicked => { root.select-channel(idx); }
+                padding-top: 10px; spacing: 8px;
+                alignment: start;
+                for srv[idx] in servers: Rectangle {
+                    height: 44px;
+                    TouchArea {
+                        clicked => { root.selected-server = idx; }
+                    }
+                    // left blurple pill on the active server
+                    if root.selected-server == idx: Rectangle {
+                        x: 0px; y: 9px; width: 4px; height: 26px;
+                        border-radius: 2px; background: Palette.accent;
+                    }
                     Rectangle {
-                        width: parent.width; height: parent.height;
-                        border-radius: 4px;
-                        background: root.selected == idx ? #40444b : transparent;
+                        x: (parent.width - 44px) / 2;
+                        width: 44px; height: 44px; border-radius: 22px;
+                        background: Palette.avatars[Math.mod(srv.color, 8)];
+                        border-width: root.selected-server == idx ? 2px : 0px;
+                        border-color: Palette.text;
                         Text {
-                            text: ch.name;
-                            color: root.selected == idx ? white : #8292a2;
-                            font-size: 14px; font-weight: 600;
-                            vertical-alignment: center;
-                            x: 8px;
+                            text: srv.initial;
+                            color: white; font-size: 17px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center;
                         }
                     }
                 }
             }
         }
 
-        // ---- main ----
-        VerticalLayout {
-            spacing: 0px;
-            ScrollView {
-                VerticalLayout {
-                    spacing: 2px;
-                    for msg in messages: MessageRow { msg: msg; }
+        // ---- channel sidebar ----
+        Rectangle {
+            width: 200px;
+            background: Palette.side;
+            VerticalLayout { spacing: 0;
+                Rectangle {
+                    height: 48px;
+                    Text {
+                        text: "咕咕";
+                        color: Palette.text; font-size: 15px; font-weight: 700;
+                        vertical-alignment: center; x: 14px;
+                    }
+                }
+                ScrollView {
+                    VerticalLayout {
+                        padding-left: 8px; padding-right: 8px; padding-bottom: 8px;
+                        spacing: 2px; alignment: start;
+                        for ch[idx] in channels: TouchArea {
+                            height: 30px;
+                            clicked => {
+                                if !ch.header { root.select-channel(idx); }
+                            }
+                            Rectangle {
+                                width: parent.width; height: parent.height;
+                                border-radius: 4px;
+                                background: root.selected == idx && !ch.header ? Palette.selected : transparent;
+                                Text {
+                                    text: ch.name;
+                                    color: ch.header ? Palette.muted : (root.selected == idx ? white : Palette.text-secondary);
+                                    font-size: ch.header ? 11px : 14px;
+                                    font-weight: ch.header ? 700 : 600;
+                                    vertical-alignment: center; x: 6px;
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            Rectangle {
-                height: 52px;
-                background: #3f4147;
-                HorizontalLayout {
-                    padding: 8px; spacing: 8px;
-                    LineEdit {
-                        text <=> root.draft;
-                        placeholder-text: "说点什么…";
+        }
+
+        // ---- main chat ----
+        Rectangle {
+            background: Palette.chat;
+            VerticalLayout { spacing: 0;
+
+                // header: channel title + member list toggle
+                Rectangle {
+                    height: 48px;
+                    background: Palette.header;
+                    Text {
+                        text: channels[selected].name;
+                        color: Palette.text; font-size: 15px; font-weight: 700;
+                        vertical-alignment: center; y: 0px; height: 100%; x: 14px;
                     }
                     Button {
-                        text: "发送";
-                        clicked => { root.send(); }
+                        x: parent.width - self.width - 12px;
+                        y: (parent.height - self.height) / 2;
+                        width: 88px; height: 32px;
+                        text: root.show-members ? "隐藏成员" : "显示成员";
+                        clicked => { root.show-members = !root.show-members; }
+                    }
+                }
+
+                ScrollView {
+                    VerticalLayout {
+                        padding-top: 10px; padding-bottom: 10px;
+                        spacing: 0; alignment: start;
+                        for msg in messages: MessageRow { msg: msg; }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px; background: Palette.header;
+                }
+                Rectangle {
+                    height: 56px;
+                    background: Palette.chat;
+                    HorizontalLayout {
+                        padding-left: 14px; padding-right: 14px; padding-top: 10px; padding-bottom: 10px; spacing: 8px;
+                        LineEdit {
+                            text <=> root.draft;
+                            placeholder-text: "说点什么…";
+                        }
+                        Button {
+                            text: "发送";
+                            clicked => { root.send(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- collapsible member list ----
+        if root.show-members: Rectangle {
+            width: 240px;
+            background: Palette.side;
+            VerticalLayout { spacing: 0; alignment: start;
+                Rectangle {
+                    height: 48px;
+                    Text {
+                        text: "在线";
+                        color: Palette.muted; font-size: 11px; font-weight: 700;
+                        vertical-alignment: center; x: 16px;
+                    }
+                }
+                for mbr in members: Rectangle {
+                    height: 36px;
+                    HorizontalLayout {
+                        padding-left: 12px; spacing: 8px;
+                        Rectangle {
+                            width: 28px; height: 28px; border-radius: 14px;
+                            background: Palette.avatars[Math.mod(mbr.color, 8)];
+                            Text {
+                                text: mbr.initial;
+                                color: white; font-size: 13px; font-weight: 600;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                        Text {
+                            text: mbr.name;
+                            color: Palette.text-secondary; font-size: 13px;
+                            vertical-alignment: center;
+                        }
                     }
                 }
             }
