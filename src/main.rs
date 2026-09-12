@@ -5,42 +5,20 @@
 // the current frame into the model row. ponytail: one timer for the demo;
 // batch per-sticker timers when real chat has many gifs on screen.
 
-use image::AnimationDecoder; // brings into_frames() into scope
 use slint::{
-    ComponentHandle, Image as SlintImage, Model, ModelRc, SharedPixelBuffer, SharedString, Timer,
-    TimerMode, VecModel,
+    ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel,
 };
 use std::cell::RefCell;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod stickers;
+use stickers::{load_gif, StickerFrames};
+
 slint::include_modules!();
 
-/// All decoded frames of one animated GIF + per-frame delays (ms).
-struct GifFrames {
-    frames: Vec<SlintImage>,
-    delays: Vec<u64>,
-}
-
-/// Decode every frame of a GIF file into Slint images (RGBA, straight alpha).
-fn load_gif(path: &str) -> GifFrames {
-    let data = std::fs::read(path).expect(path);
-    let reader = std::io::Cursor::new(&data);
-    let decoder = image::codecs::gif::GifDecoder::new(reader).expect("gif decode");
-    let mut frames = Vec::new();
-    let mut delays = Vec::new();
-    for frame in decoder.into_frames() {
-        let frame = frame.expect("gif frame");
-        let ms = Duration::from(frame.delay()).as_millis().clamp(20, 5000) as u64;
-        let buf = frame.into_buffer(); // RgbaImage (straight alpha)
-        let shared =
-            SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(buf.as_raw(), buf.width(), buf.height());
-        frames.push(SlintImage::from_rgba8(shared));
-        delays.push(ms);
-    }
-    assert!(!frames.is_empty(), "gif has no frames");
-    GifFrames { frames, delays }
-}
+// GIF decoding lives in `stickers` — it also backs the sticker-pack scanner.
 
 /// Avatar letter: first char uppercased. `.slint` has no substring/charAt,
 /// so every text derivation happens here.
@@ -129,7 +107,9 @@ fn main() -> Result<(), slint::PlatformError> {
         ("grace", "收到", 20 * 60 + 31, false),
     ];
 
-    let gif = Rc::new(load_gif("assets/sticker.gif"));
+    let gif: Rc<StickerFrames> = Rc::new(
+        load_gif(Path::new("assets/sticker.gif")).expect("bundled demo sticker must decode"),
+    );
 
     // Group rule (Discord/Revolt): same author AND gap <= 5 min merges;
     // anything else reopens the group. Computed here, `.slint` only reads `grouped`.
@@ -150,7 +130,7 @@ fn main() -> Result<(), slint::PlatformError> {
             sticker: if *sticker {
                 gif.frames[0].clone()
             } else {
-                SlintImage::default()
+                slint::Image::default()
             },
             grouped,
         });
@@ -177,7 +157,7 @@ fn main() -> Result<(), slint::PlatformError> {
             body: draft.into(),
             time: fmt_time(min),
             color: color_of("you"),
-            sticker: SlintImage::default(),
+            sticker: slint::Image::default(),
             grouped,
         });
         *last_send.borrow_mut() = Some(("you", min));
