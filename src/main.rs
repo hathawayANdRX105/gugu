@@ -12,6 +12,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod onebot;
 mod stickers;
 use stickers::{load_gif, scan_packs, StickerFrames, StickerPack};
 
@@ -112,6 +113,44 @@ fn spawn_sticker_timer(
     );
     timer
 }
+
+// Model + grouping state stashed for the onebot bridge. `Rc` is `!Send`,
+// so the transport thread's closure can't carry it; the
+// `invoke_from_event_loop` callback runs back on this (UI) thread and
+// picks the handles up here.
+type BridgeState = (Rc<VecModel<Message>>, Rc<RefCell<Option<(String, i64)>>>);
+
+thread_local! {
+    static BRIDGE: RefCell<Option<BridgeState>> = const { RefCell::new(None) };
+}
+
+/// Append one incoming OneBot message to the chat model. Same 5-minute
+/// same-author grouping rule as local sends; shares the `last` state via
+/// [`BRIDGE`] so incoming and outgoing rows merge consistently.
+fn push_incoming(author: &str, body: &str, unix: i64) {
+    // ponytail: UTC minute-of-day like now_minutes(); TZ handling is M4's.
+    let min = unix / 60 % 1440;
+    BRIDGE.with(|b| {
+        let borrowed = b.borrow();
+        let Some((model, last)) = borrowed.as_ref() else {
+            return;
+        };
+        let grouped = last
+            .borrow()
+            .as_ref()
+            .is_some_and(|(a, m)| a == author && (0..=5).contains(&(min - *m)));
+        model.push(Message {
+            author: author.into(),
+            initial: initial(author),
+            body: body.into(),
+            time: fmt_time(min),
+            color: color_of(author),
+            sticker: slint::Image::default(),
+            grouped,
+        });
+        *last.borrow_mut() = Some((author.to_string(), min));
+    });
+}
 fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
 
@@ -186,9 +225,11 @@ fn main() -> Result<(), slint::PlatformError> {
     // anything else reopens the group. Computed here, `.slint` only reads `grouped`.
     let mut msgs: Vec<Message> = Vec::new();
     let mut sticker_row = 0usize;
-    let mut last: Option<(&str, i64)> = None;
+    let mut last: Option<(String, i64)> = None;
     for (author, body, min, sticker) in mock {
-        let grouped = last.is_some_and(|(a, m)| a == *author && *min - m <= 5);
+        let grouped = last
+            .as_ref()
+            .is_some_and(|(a, m)| a == *author && *min - m <= 5);
         if *sticker {
             sticker_row = msgs.len();
         }
@@ -205,7 +246,7 @@ fn main() -> Result<(), slint::PlatformError> {
             },
             grouped,
         });
-        last = Some((author, *min));
+        last = Some(((*author).to_string(), *min));
     }
     let model = Rc::new(VecModel::from(msgs));
     ui.set_messages(ModelRc::from(model.clone()));
@@ -214,8 +255,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui_weak = ui.as_weak();
     let model_send = model.clone();
     let last_send = Rc::new(RefCell::new(last));
-    // Text-send and sticker-pick share one grouping state.
+    // Text-send, sticker-pick and onebot events share one grouping state.
     let last_sticker = last_send.clone();
+    let last_bridge = last_send.clone();
     ui.on_send(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
         let draft = ui.get_draft().to_string();
@@ -225,7 +267,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let min = now_minutes();
         let grouped = last_send
             .borrow()
-            .is_some_and(|(a, m)| a == "you" && min - m <= 5);
+            .as_ref()
+            .is_some_and(|(a, m)| a == "you" && min - *m <= 5);
         model_send.push(Message {
             author: "you".into(),
             initial: initial("you"),
@@ -235,7 +278,7 @@ fn main() -> Result<(), slint::PlatformError> {
             sticker: slint::Image::default(),
             grouped,
         });
-        *last_send.borrow_mut() = Some(("you", min));
+        *last_send.borrow_mut() = Some(("you".to_string(), min));
         ui.set_draft("".into());
     });
 
@@ -287,7 +330,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let min = now_minutes();
         let grouped = last_pick
             .borrow()
-            .is_some_and(|(a, m)| a == "you" && min - m <= 5);
+            .as_ref()
+            .is_some_and(|(a, m)| a == "you" && min - *m <= 5);
         model_pick.push(Message {
             author: "you".into(),
             initial: initial("you"),
@@ -297,13 +341,69 @@ fn main() -> Result<(), slint::PlatformError> {
             sticker: frames.frames.first().cloned().unwrap_or_default(),
             grouped,
         });
-        *last_pick.borrow_mut() = Some(("you", min));
+        *last_pick.borrow_mut() = Some(("you".to_string(), min));
         let row = model_pick.row_count() - 1;
         if frames.frames.len() > 1 {
             let timer = spawn_sticker_timer(model_pick.clone(), row, frames);
             timers_pick.borrow_mut().push(timer);
         }
     });
+
+    // ---- onebot (M2): data/config.toml present → live events; absent → demo ----
+    let _ob_handle = match onebot::Config::load(Path::new("data/config.toml")) {
+        Ok(config) => {
+            BRIDGE.with(|b| *b.borrow_mut() = Some((model.clone(), last_bridge)));
+            let weak_ob = ui.as_weak();
+            // on_event runs on the transport thread; only Send values may be
+            // captured, so the event itself hops into the UI event loop and
+            // the Rc handles come back out of the thread-local BRIDGE.
+            Some(onebot::spawn(
+                config,
+                Box::new(move |ev| {
+                    let weak = weak_ob.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(ui) = weak.upgrade() else { return };
+                        match ev {
+                            onebot::Event::Connected => ui.set_conn_label("已连接".into()),
+                            onebot::Event::Login { nickname, .. } => {
+                                ui.set_conn_label(format!("已连接 · {nickname}").into());
+                            }
+                            onebot::Event::PrivateMessage {
+                                sender_name,
+                                text,
+                                time,
+                                ..
+                            }
+                            | onebot::Event::GroupMessage {
+                                sender_name,
+                                text,
+                                time,
+                                ..
+                            } => {
+                                push_incoming(&sender_name, &text, time);
+                            }
+                        }
+                    });
+                }),
+            ))
+        }
+        Err(e) => {
+            eprintln!("未找到 data/config.toml，运行在演示模式: {e}");
+            None
+        }
+    };
+
+    // Smoke seam (same GUGU_* convention): GUGU_SMOKE_ONEBOT pushes one
+    // synthetic event through the bridge — verifies the message/conn-label
+    // display path without a live WS peer. No-op unless config loaded too.
+    if std::env::var_os("GUGU_SMOKE_ONEBOT").is_some() && _ob_handle.is_some() {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        ui.set_conn_label("已连接 · smoke".into());
+        push_incoming("smoke", "onebot 桥接自检消息", secs);
+    }
 
     // Smoke seam (AGENTS 测试分层: 启动 + grim + 帧差): GUGU_SMOKE opens the
     // picker and sends one animated sticker through the real handlers, so the

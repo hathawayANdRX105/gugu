@@ -1,0 +1,9 @@
+# 咕咕 gugu — OneBot v11 客户端配置模板
+# 复制为 data/config.toml 后启动即可接入真实事件；
+# 没有 data/config.toml 时应用保持演示模式（纯本地 mock 数据）。
+
+# 协议端（NapCat / Lagrange 等）的 forward-WS 地址。
+ws_url = "ws://127.0.0.1:3001"
+
+# access_token，作为 ?access_token=... 查询参数拼到 ws_url；留空 = 不鉴权。
+access_token = ""
