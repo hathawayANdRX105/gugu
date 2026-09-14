@@ -130,6 +130,7 @@ export component MainWindow inherits Window {
     in property <[StickerCell]> sticker-cells;
     in property <length> grid-height;
     in-out property <int> current-pack: 0;
+    in property <string> conn-label: "演示模式";
     callback send();
     callback select-channel(index: int);
     callback select-pack(index: int);
@@ -178,10 +179,27 @@ export component MainWindow inherits Window {
             VerticalLayout { spacing: 0;
                 Rectangle {
                     height: 48px;
-                    Text {
-                        text: "咕咕";
-                        color: Palette.text; font-size: 15px; font-weight: 700;
-                        vertical-alignment: center; x: 14px;
+                    // Title + connection status (Rust sets conn-label:
+                    // 演示模式 / 已连接 / 已连接 · nickname).
+                    VerticalLayout {
+                        padding-left: 14px; padding-top: 7px; spacing: 1px;
+                        Text {
+                            text: "咕咕";
+                            color: Palette.text; font-size: 15px; font-weight: 700;
+                            horizontal-alignment: left;
+                        }
+                        HorizontalLayout {
+                            spacing: 5px; alignment: start;
+                            Rectangle {
+                                width: 7px; height: 7px; border-radius: 4px;
+                                background: root.conn-label == "演示模式" ? Palette.muted : #27ae60;
+                            }
+                            Text {
+                                text: root.conn-label;
+                                color: Palette.muted; font-size: 10px;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
                 ScrollView {

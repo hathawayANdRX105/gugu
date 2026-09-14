@@ -1,6 +1,7 @@
 /target
 todo/
-data/
+data/*
+!data/config.example.toml
 .env
 .env.*
 *.pem

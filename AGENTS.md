@@ -24,13 +24,13 @@
 | 术语 | 位置 | 含义 |
 |---|---|---|
 | **UI** | `ui.slint` | 全部 Slint 声明式界面；组件化用 `component`，数据用 `struct` + `in property` |
-| **逻辑** | `src/main.rs` | 入口 + 状态管理 + GIF 帧播放器 + （M2 起）协议桥接 |
+| **逻辑** | `src/main.rs` | 入口 + 状态管理 + GIF 帧播放器；协议桥接在 `src/onebot.rs` |
 | **静态资源** | `assets/` | 测试贴纸与图标；运行时加载，不嵌进二进制 |
 | **路线** | `todo/` | 实现路线与阶段文档（gitignored，不持久化） |
 | **构建产物** | `target/` | gitignored；可随时删除重建 |
 
-M2 起若文件增长，`src/` 按模块拆分（`protocol.rs` / `stickers.rs` / `state.rs`），
-`main.rs` 只留入口与组装。
+`src/` 按模块拆分（已落地：`onebot.rs` = OneBot v11 传输与桥接、`stickers.rs` = GIF 解帧
+与贴纸包扫描），`main.rs` 只留入口、UI 接线与组装。
 
 ## Slint 约定（踩过坑的，直接遵守）
 
