@@ -477,5 +477,33 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // Smoke seam: GUGU_SMOKE_SEND exercises the real send addressing — pick
+    // the first non-header roster row, set a fixed draft, invoke_send(), so
+    // on_send's peer_id/is_group routing runs without synthetic pointer
+    // input; the log line is diffed against the mock's stderr. The roster
+    // lands asynchronously (WS handshake + get_friend_list/get_group_list
+    // replies rebuild the sidebar), hence the 3 s delay. No-op otherwise.
+    if std::env::var_os("GUGU_SMOKE_SEND").is_some() && ob_handle.is_some() {
+        let weak = ui.as_weak();
+        Timer::single_shot(Duration::from_millis(3000), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let channels = ui.get_channels();
+            let Some((idx, ch)) = (0..channels.row_count())
+                .filter_map(|i| Some((i, channels.row_data(i)?)))
+                .find(|(_, c)| !c.header)
+            else {
+                eprintln!("gugu: smoke send skipped — roster not in sidebar");
+                return;
+            };
+            ui.set_selected(idx as i32);
+            ui.set_draft("smoke send probe".into());
+            ui.invoke_send();
+            eprintln!(
+                "gugu: smoke send -> row={} peer_id={} is_group={}",
+                ch.name, ch.peer_id, ch.is_group
+            );
+        });
+    }
+
     ui.run()
 }
