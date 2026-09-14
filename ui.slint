@@ -33,6 +33,8 @@ export struct Server {
 export struct Channel {
     name: string,
     header: bool,      // section label row, not selectable
+    peer_id: string,   // QQ id as string (i64 outlives slint's i32); "" = header/demo row
+    is_group: bool,    // true → SendGroup, false → SendPrivate
 }
 
 export struct Member {

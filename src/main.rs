@@ -179,6 +179,9 @@ fn main() -> Result<(), slint::PlatformError> {
     .map(|(n, h)| Channel {
         name: (*n).into(),
         header: *h,
+        // Demo rows carry no peer id → sends stay local echo (see on_send).
+        peer_id: "".into(),
+        is_group: false,
     })
     .collect();
     ui.set_channels(Rc::new(VecModel::from(channels)).into());
@@ -258,11 +261,109 @@ fn main() -> Result<(), slint::PlatformError> {
     // Text-send, sticker-pick and onebot events share one grouping state.
     let last_sticker = last_send.clone();
     let last_bridge = last_send.clone();
+
+    // ---- onebot (M2): data/config.toml present → live events; absent → demo ----
+    // Spawned before `on_send` so sends can address the selected peer. The
+    // transport thread survives disconnects (reconnect loop), so `Some` here
+    // means "configured"; actions queued while down drain on the next session.
+    let ob_handle = Rc::new(match onebot::Config::load(Path::new("data/config.toml")) {
+        Ok(config) => {
+            BRIDGE.with(|b| *b.borrow_mut() = Some((model.clone(), last_bridge)));
+            let weak_ob = ui.as_weak();
+            // on_event runs on the transport thread; only Send values may be
+            // captured, so the event itself hops into the UI event loop and
+            // the Rc handles come back out of the thread-local BRIDGE.
+            Some(onebot::spawn(
+                config,
+                Box::new(move |ev| {
+                    let weak = weak_ob.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(ui) = weak.upgrade() else { return };
+                        match ev {
+                            onebot::Event::Connected => ui.set_conn_label("已连接".into()),
+                            onebot::Event::Login { nickname, .. } => {
+                                ui.set_conn_label(format!("已连接 · {nickname}").into());
+                            }
+                            onebot::Event::PrivateMessage {
+                                sender_name,
+                                text,
+                                time,
+                                ..
+                            }
+                            | onebot::Event::GroupMessage {
+                                sender_name,
+                                text,
+                                time,
+                                ..
+                            } => {
+                                // ponytail: still one shared transcript; per-conversation
+                                // routing by sender/group id is T6's.
+                                push_incoming(&sender_name, &text, time);
+                            }
+                            // T5: real friends/groups replace the mock sidebar. Two
+                            // segments, header row first; QQ ids travel as strings
+                            // (slint `int` is i32 and cannot hold them).
+                            onebot::Event::Roster { peers } => {
+                                let mut rows: Vec<Channel> = Vec::new();
+                                for (label, group) in [("私信", false), ("群聊", true)] {
+                                    let seg: Vec<&onebot::Peer> =
+                                        peers.iter().filter(|p| p.is_group == group).collect();
+                                    if seg.is_empty() {
+                                        continue;
+                                    }
+                                    rows.push(Channel {
+                                        name: label.into(),
+                                        header: true,
+                                        peer_id: "".into(),
+                                        is_group: false,
+                                    });
+                                    rows.extend(seg.into_iter().map(|p| Channel {
+                                        name: p.name.as_str().into(),
+                                        header: false,
+                                        peer_id: p.id.to_string().into(),
+                                        is_group: p.is_group,
+                                    }));
+                                }
+                                let first = rows.iter().position(|r| !r.header).unwrap_or(0) as i32;
+                                ui.set_channels(Rc::new(VecModel::from(rows)).into());
+                                ui.set_selected(first);
+                            }
+                        }
+                    });
+                }),
+            ))
+        }
+        Err(e) => {
+            eprintln!("未找到 data/config.toml，运行在演示模式: {e}");
+            None
+        }
+    });
+    let ob_send = ob_handle.clone();
     ui.on_send(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
         let draft = ui.get_draft().to_string();
         if draft.trim().is_empty() {
             return;
+        }
+        // T5 addressing: the selected sidebar row carries the peer id. Header
+        // rows (peer_id ""), unparseable ids and demo mode echo locally only.
+        let target = ui
+            .get_channels()
+            .row_data(ui.get_selected().max(0) as usize);
+        if let (Some(ob), Some(ch)) = (ob_send.as_ref(), target) {
+            if let Ok(peer_id) = ch.peer_id.parse::<i64>() {
+                ob.send(if ch.is_group {
+                    onebot::Action::SendGroup {
+                        group_id: peer_id,
+                        text: draft.clone(),
+                    }
+                } else {
+                    onebot::Action::SendPrivate {
+                        user_id: peer_id,
+                        text: draft.clone(),
+                    }
+                });
+            }
         }
         let min = now_minutes();
         let grouped = last_send
@@ -349,54 +450,10 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // ---- onebot (M2): data/config.toml present → live events; absent → demo ----
-    let _ob_handle = match onebot::Config::load(Path::new("data/config.toml")) {
-        Ok(config) => {
-            BRIDGE.with(|b| *b.borrow_mut() = Some((model.clone(), last_bridge)));
-            let weak_ob = ui.as_weak();
-            // on_event runs on the transport thread; only Send values may be
-            // captured, so the event itself hops into the UI event loop and
-            // the Rc handles come back out of the thread-local BRIDGE.
-            Some(onebot::spawn(
-                config,
-                Box::new(move |ev| {
-                    let weak = weak_ob.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        let Some(ui) = weak.upgrade() else { return };
-                        match ev {
-                            onebot::Event::Connected => ui.set_conn_label("已连接".into()),
-                            onebot::Event::Login { nickname, .. } => {
-                                ui.set_conn_label(format!("已连接 · {nickname}").into());
-                            }
-                            onebot::Event::PrivateMessage {
-                                sender_name,
-                                text,
-                                time,
-                                ..
-                            }
-                            | onebot::Event::GroupMessage {
-                                sender_name,
-                                text,
-                                time,
-                                ..
-                            } => {
-                                push_incoming(&sender_name, &text, time);
-                            }
-                        }
-                    });
-                }),
-            ))
-        }
-        Err(e) => {
-            eprintln!("未找到 data/config.toml，运行在演示模式: {e}");
-            None
-        }
-    };
-
     // Smoke seam (same GUGU_* convention): GUGU_SMOKE_ONEBOT pushes one
     // synthetic event through the bridge — verifies the message/conn-label
     // display path without a live WS peer. No-op unless config loaded too.
-    if std::env::var_os("GUGU_SMOKE_ONEBOT").is_some() && _ob_handle.is_some() {
+    if std::env::var_os("GUGU_SMOKE_ONEBOT").is_some() && ob_handle.is_some() {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -417,6 +474,34 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(ui) = weak.upgrade() {
                 ui.invoke_pick_sticker(1, 0);
             }
+        });
+    }
+
+    // Smoke seam: GUGU_SMOKE_SEND exercises the real send addressing — pick
+    // the first non-header roster row, set a fixed draft, invoke_send(), so
+    // on_send's peer_id/is_group routing runs without synthetic pointer
+    // input; the log line is diffed against the mock's stderr. The roster
+    // lands asynchronously (WS handshake + get_friend_list/get_group_list
+    // replies rebuild the sidebar), hence the 3 s delay. No-op otherwise.
+    if std::env::var_os("GUGU_SMOKE_SEND").is_some() && ob_handle.is_some() {
+        let weak = ui.as_weak();
+        Timer::single_shot(Duration::from_millis(3000), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let channels = ui.get_channels();
+            let Some((idx, ch)) = (0..channels.row_count())
+                .filter_map(|i| Some((i, channels.row_data(i)?)))
+                .find(|(_, c)| !c.header)
+            else {
+                eprintln!("gugu: smoke send skipped — roster not in sidebar");
+                return;
+            };
+            ui.set_selected(idx as i32);
+            ui.set_draft("smoke send probe".into());
+            ui.invoke_send();
+            eprintln!(
+                "gugu: smoke send -> row={} peer_id={} is_group={}",
+                ch.name, ch.peer_id, ch.is_group
+            );
         });
     }
 
