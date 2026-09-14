@@ -2,8 +2,10 @@
 //!
 //! Self-contained on purpose: gugu is a bin-only crate, so an example cannot
 //! import its modules. Run this, point `data/config.toml`'s `ws_url` at it,
-//! start gugu — it replies to `get_login_info`, pushes one private message
-//! every 5s, and echoes every action frame it receives to stderr.
+//! start gugu — it answers `get_login_info`, `get_friend_list` and
+//! `get_group_list` with a mock roster, acks `send_private_msg` /
+//! `send_group_msg` (logging target and text), pushes a private message
+//! from a roster friend every 5s, and echoes every action to stderr.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,8 +16,15 @@ use tokio_tungstenite::tungstenite::Message;
 
 /// Identity the mock reports to `get_login_info`.
 const BOT: (u64, &str) = (10001, "MockBot");
-/// Sender of the pushed private messages.
-const FRIEND: (u64, &str) = (20001, "MockFriend");
+/// Roster reported to `get_friend_list`: (user_id, nickname, remark).
+/// Pushed private messages rotate senders through this list.
+const FRIENDS: [(u64, &str, &str); 3] = [
+    (20001, "MockFriend", "老咕咕"),
+    (20002, "咕咕鸡", ""),
+    (20003, "TestPal", ""),
+];
+/// Roster reported to `get_group_list`: (group_id, group_name).
+const GROUPS: [(u64, &str); 2] = [(30001, "咕咕交流群"), (30002, "Mock群")];
 /// Rotated message texts.
 const LINES: [&str; 3] = ["咕咕咕（mock）", "吃了吗？（mock）", "测试测试 123（mock）"];
 
@@ -41,9 +50,11 @@ async fn serve(stream: TcpStream) {
     let (mut sink, mut src) = ws.split();
     let mut push = tokio::time::interval(Duration::from_secs(5));
     let mut line = 0usize;
+    let mut mid = 0u64;
     loop {
         tokio::select! {
             _ = push.tick() => {
+                let (fid, fname, _) = FRIENDS[line % FRIENDS.len()];
                 let text = LINES[line % LINES.len()];
                 line += 1;
                 let event = json!({
@@ -54,7 +65,7 @@ async fn serve(stream: TcpStream) {
                     "sub_type": "friend",
                     "message_id": line,
                     "font": 14,
-                    "sender": { "user_id": FRIEND.0, "nickname": FRIEND.1, "card": "", "sex": "unknown", "age": 0, "level": "5" },
+                    "sender": { "user_id": fid, "nickname": fname, "card": "", "sex": "unknown", "age": 0, "level": "5" },
                     "message": text,
                     "raw_message": text,
                 });
@@ -71,16 +82,52 @@ async fn serve(stream: TcpStream) {
                 };
                 let action = frame["action"].as_str().unwrap_or("?");
                 eprintln!("mock_onebot <- action: {action} params: {}", frame["params"]);
-                if action == "get_login_info" {
-                    let reply = json!({
-                        "status": "ok", "retcode": 0, "echo": frame["echo"],
-                        "data": { "user_id": BOT.0, "nickname": BOT.1, "sex": "male", "age": 0, "level": 1 }
-                    });
-                    if sink.send(Message::Text(reply.to_string().into())).await.is_err() {
-                        return;
+                match action {
+                    "get_login_info" => {
+                        let data = json!({ "user_id": BOT.0, "nickname": BOT.1, "sex": "male", "age": 0, "level": 1 });
+                        if sink.send(Message::Text(ok(&frame, data).into())).await.is_err() {
+                            return;
+                        }
                     }
+                    "get_friend_list" => {
+                        let data: Vec<Value> = FRIENDS
+                            .iter()
+                            .map(|(id, nick, remark)| json!({ "user_id": id, "nickname": nick, "remark": remark }))
+                            .collect();
+                        if sink.send(Message::Text(ok(&frame, Value::Array(data)).into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    "get_group_list" => {
+                        let data: Vec<Value> = GROUPS
+                            .iter()
+                            .map(|(id, name)| json!({ "group_id": id, "group_name": name }))
+                            .collect();
+                        if sink.send(Message::Text(ok(&frame, Value::Array(data)).into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    "send_private_msg" | "send_group_msg" => {
+                        let target = if action == "send_private_msg" {
+                            frame["params"]["user_id"].clone()
+                        } else {
+                            frame["params"]["group_id"].clone()
+                        };
+                        let text = frame["params"]["message"].as_str().unwrap_or("?");
+                        mid += 1;
+                        eprintln!("mock_onebot -> {action} to {target}: {text} (message_id {mid})");
+                        if sink.send(Message::Text(ok(&frame, json!({ "message_id": mid })).into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
+}
+
+/// A retcode-0 reply frame echoing the request's `echo`, carrying `data`.
+fn ok(frame: &Value, data: Value) -> String {
+    json!({ "status": "ok", "retcode": 0, "echo": frame["echo"], "data": data }).to_string()
 }
