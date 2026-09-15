@@ -1,6 +1,9 @@
 // 咕咕 gugu — Revolt-style three-pane chat UI (Slint, software renderer)
 // Layout: server rail | channel sidebar | chat (header + messages + input) | collapsible members.
-// Animated stickers: Rust decodes GIF frames and drives the model row (no native gif, #2081).
+// Animated stickers: Slint has no native gif (upstream #2081), so Rust decodes
+// the frames once and publishes the current one through the `StickerAnim`
+// global — rows pick it up by uid, and the message model is never rewritten
+// per frame (rewriting a row dirtied its layout, and thus the whole pane).
 // Palette refined from revite dark preset (revite/src/context/Theme.tsx), accent = blurple.
 
 import { LineEdit, Button, ScrollView } from "std-widgets.slint";
@@ -22,6 +25,15 @@ global Palette {
     out property <color> body: #dbdee1;
     out property <color> accent: #5865f2;
     out property <color> selected: #5865f226; // blurple @ ~15%
+}
+// Animated-sticker frame channel. One Rust timer owns the whole animation:
+// each tick it publishes the row uid it advanced and that frame here. Rows
+// compare `msg.uid` against `active-uid` to pick the live frame or their own
+// static first frame. Keeping frames out of the message model is what stops
+// the per-frame row rewrite that dirtied every row's layout (M2 stall).
+export global StickerAnim {
+    in property <int> active-uid: -1;   // -1 = no row animating
+    in property <image> frame;
 }
 
 export struct Server {
@@ -49,8 +61,9 @@ export struct Message {
     body: string,
     time: string,
     color: int,
-    sticker: image,    // empty image = no sticker; Rust drives gif frames
+    sticker: image,    // empty image = no sticker; the animation swaps frames in place
     grouped: bool,     // continuation of same author's group: body-only row, indented
+    uid: int,          // stable row id, assigned once on insert and never re-assigned
 }
 
 // One grid cell of the sticker picker: precomputed first-frame thumbnail
@@ -101,13 +114,18 @@ component MessageRow inherits Rectangle {
                 wrap: word-wrap;
                 width: 100%;
             }
-            // animated sticker slot: frame image driven from Rust (gif loop).
-            // Conditional element: an invisible Image would still claim its
-            // 120px cell in the layout and stretch every plain row.
-            if msg.sticker.width > 0: Image {
-                width: sticker-size; height: sticker-size;
+            // Animated sticker slot. The element tree is static — no `if` on
+            // msg.sticker — so the row's layout is computed once when the row
+            // is pushed and the gif loop never re-dirties it: the timer only
+            // rewrites the StickerAnim global, and this `source` binding then
+            // changes pixels inside a cell whose size was fixed at insert.
+            // An empty sticker image collapses the cell to 0px, so plain text
+            // rows pay no space for the slot.
+            Image {
+                width: msg.sticker.width > 0 ? sticker-size : 0px;
+                height: msg.sticker.width > 0 ? sticker-size : 0px;
                 image-fit: contain;
-                source: msg.sticker;
+                source: StickerAnim.active-uid == msg.uid ? StickerAnim.frame : msg.sticker;
             }
         }
     }
