@@ -149,7 +149,11 @@ fn register_anim(
     uid: i32,
     frames: Rc<StickerFrames>,
 ) {
-    anims.borrow_mut().push(AnimRow { uid, frames, idx: 0 });
+    anims.borrow_mut().push(AnimRow {
+        uid,
+        frames,
+        idx: 0,
+    });
     if !timer.running() {
         start_anim_loop(ui.clone(), anims.clone(), cursor.clone(), timer.clone());
     }
@@ -503,7 +507,14 @@ fn main() -> Result<(), slint::PlatformError> {
         *last_pick.borrow_mut() = Some(("you".to_string(), min));
         // A static (single-frame) sticker has nothing to animate.
         if frames.frames.len() > 1 {
-            register_anim(&ui_weak_pick, &anims_pick, &cursor_pick, &timer_pick, uid, frames);
+            register_anim(
+                &ui_weak_pick,
+                &anims_pick,
+                &cursor_pick,
+                &timer_pick,
+                uid,
+                frames,
+            );
         }
     });
 
