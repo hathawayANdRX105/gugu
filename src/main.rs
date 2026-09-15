@@ -1,15 +1,17 @@
 // 咕咕 gugu — lightweight QQ chat client (Slint software renderer)
 //
 // Animated stickers: Slint has no native GIF animation (upstream #2081).
-// We decode all GIF frames once with `image`, then a slint::Timer swaps
-// the current frame into the model row. ponytail: one timer per animated
-// message row; if that ever measures hot, collapse to one shared ticker
-// driving all (row, frame-index) pairs.
+// We decode all frames once with `image`, then a single `slint::Timer`
+// advances one animated row per tick (round-robin) and publishes its frame
+// through the `StickerAnim` global. Rows pick the frame up by uid, so the
+// message model is never rewritten per frame — rewriting a row marked its
+// layout dirty, which re-laid-out the whole scroll pane every tick.
 
-use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
-use std::cell::RefCell;
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod onebot;
@@ -82,36 +84,79 @@ fn show_pack(ui: &MainWindow, packs: &[StickerPack], pack: usize) {
     ui.set_sticker_cells(Rc::new(VecModel::from(cells)).into());
 }
 
-/// Drive one message row's sticker animation with per-frame delays, exactly
-/// the M0 frame-player pattern. Returns a running `Timer` the caller must
-/// keep alive (dropping it stops the animation).
-fn spawn_sticker_timer(
-    model: Rc<VecModel<Message>>,
-    row: usize,
+/// Stable row identity: assigned once at insert and never re-assigned, so
+/// the animation loop can address a row without ever rewriting the model.
+static NEXT_UID: AtomicI32 = AtomicI32::new(0);
+
+fn next_uid() -> i32 {
+    NEXT_UID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One registered sticker animation: the row's `uid`, its decoded frames,
+/// and the index of the frame currently on display. Rows are append-only,
+/// so entries are never removed.
+struct AnimRow {
+    uid: i32,
     frames: Rc<StickerFrames>,
-) -> Rc<Timer> {
-    let timer = Rc::new(Timer::default());
-    let state = Rc::new(RefCell::new(0usize)); // current frame index
-    let (frames_c, state_c, model_c, timer_c) =
-        (frames.clone(), state.clone(), model.clone(), timer.clone());
+    idx: usize,
+}
+
+/// Advance one animated row per tick, round-robin, and publish its current
+/// frame through the `StickerAnim` global. Because the message model is
+/// never touched, no row's layout is re-dirtied by the animation — only the
+/// active row's `Image` repaints. The interval is re-armed each tick to the
+/// frame's own delay.
+fn start_anim_loop(
+    ui: Weak<MainWindow>,
+    anims: Rc<RefCell<Vec<AnimRow>>>,
+    cursor: Rc<Cell<usize>>,
+    timer: Rc<Timer>,
+) {
+    let timer_c = timer.clone();
     timer.start(
         TimerMode::Repeated,
-        Duration::from_millis(frames.delays[0]),
+        Duration::from_millis(20), // first tick is immediate-ish; the loop re-arms per frame
         move || {
-            let gif = frames_c.clone();
-            let i = *state_c.borrow();
-
-            let Some(mut m) = model_c.row_data(row) else {
+            let Some(ui) = ui.upgrade() else { return };
+            let globals = ui.global::<StickerAnim>();
+            let mut rows = anims.borrow_mut();
+            // ponytail: rows are append-only, so this stays cold; stopping a
+            // Repeated timer from its own callback would leave the loop unable
+            // to restart on a later registration, so it just idles instead.
+            if rows.is_empty() {
+                globals.set_active_uid(-1);
                 return;
-            };
-            m.sticker = gif.frames[i].clone();
-            model_c.set_row_data(row, m);
-            let next = (i + 1) % gif.frames.len();
-            *state_c.borrow_mut() = next;
-            timer_c.set_interval(Duration::from_millis(gif.delays[next]));
+            }
+            let i = cursor.get() % rows.len();
+            let row = &mut rows[i];
+            globals.set_active_uid(row.uid);
+            globals.set_frame(row.frames.frames[row.idx].clone());
+            row.idx = (row.idx + 1) % row.frames.frames.len();
+            timer_c.set_interval(Duration::from_millis(row.frames.delays[row.idx]));
+            cursor.set((i + 1) % rows.len());
         },
     );
-    timer
+}
+
+/// Register one row's animation. The loop is started lazily on the first
+/// registration and then runs for the window's lifetime; the round-robin
+/// cursor picks newly registered rows up on the next tick.
+fn register_anim(
+    ui: &Weak<MainWindow>,
+    anims: &Rc<RefCell<Vec<AnimRow>>>,
+    cursor: &Rc<Cell<usize>>,
+    timer: &Rc<Timer>,
+    uid: i32,
+    frames: Rc<StickerFrames>,
+) {
+    anims.borrow_mut().push(AnimRow {
+        uid,
+        frames,
+        idx: 0,
+    });
+    if !timer.running() {
+        start_anim_loop(ui.clone(), anims.clone(), cursor.clone(), timer.clone());
+    }
 }
 
 // Model + grouping state stashed for the onebot bridge. `Rc` is `!Send`,
@@ -142,6 +187,7 @@ fn push_incoming(author: &str, body: &str, unix: i64) {
         model.push(Message {
             author: author.into(),
             initial: initial(author),
+            uid: next_uid(),
             body: body.into(),
             time: fmt_time(min),
             color: color_of(author),
@@ -227,14 +273,15 @@ fn main() -> Result<(), slint::PlatformError> {
     // Group rule (Discord/Revolt): same author AND gap <= 5 min merges;
     // anything else reopens the group. Computed here, `.slint` only reads `grouped`.
     let mut msgs: Vec<Message> = Vec::new();
-    let mut sticker_row = 0usize;
+    let mut sticker_uid = -1;
     let mut last: Option<(String, i64)> = None;
     for (author, body, min, sticker) in mock {
         let grouped = last
             .as_ref()
             .is_some_and(|(a, m)| a == *author && *min - m <= 5);
+        let uid = next_uid();
         if *sticker {
-            sticker_row = msgs.len();
+            sticker_uid = uid;
         }
         msgs.push(Message {
             author: (*author).into(),
@@ -248,6 +295,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 slint::Image::default()
             },
             grouped,
+            uid,
         });
         last = Some(((*author).to_string(), *min));
     }
@@ -378,6 +426,7 @@ fn main() -> Result<(), slint::PlatformError> {
             color: color_of("you"),
             sticker: slint::Image::default(),
             grouped,
+            uid: next_uid(),
         });
         *last_send.borrow_mut() = Some(("you".to_string(), min));
         ui.set_draft("".into());
@@ -391,12 +440,21 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // ---- sticker animation timers ----
-    // One timer per animated row; kept alive for the window's lifetime.
-    let timers = Rc::new(RefCell::new(Vec::<Rc<Timer>>::new()));
-    timers
-        .borrow_mut()
-        .push(spawn_sticker_timer(model.clone(), sticker_row, gif.clone()));
+    // ---- sticker animation ----
+    // One timer drives every animated row (round-robin over the registry
+    // below); kept alive for the window's lifetime. Frames are published
+    // through the StickerAnim global, never through the model.
+    let anims: Rc<RefCell<Vec<AnimRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let anim_cursor = Rc::new(Cell::new(0usize));
+    let anim_timer = Rc::new(Timer::default());
+    register_anim(
+        &ui.as_weak(),
+        &anims,
+        &anim_cursor,
+        &anim_timer,
+        sticker_uid,
+        gif.clone(),
+    );
 
     // ---- sticker picker (M3): scan_packs at startup, no hardcoded list ----
     // Memory budget (AGENTS #1): packs decode once at startup; demo assets
@@ -413,10 +471,12 @@ fn main() -> Result<(), slint::PlatformError> {
             show_pack(&ui, &packs_tab, idx as usize);
         }
     });
-
     let model_pick = model.clone();
     let packs_pick = packs.clone();
-    let timers_pick = timers.clone();
+    let anims_pick = anims.clone();
+    let cursor_pick = anim_cursor.clone();
+    let timer_pick = anim_timer.clone();
+    let ui_weak_pick = ui.as_weak();
     let last_pick = last_sticker;
     ui.on_pick_sticker(move |pack, index| {
         // scan_packs never fails; a bad index just drops the click.
@@ -433,6 +493,7 @@ fn main() -> Result<(), slint::PlatformError> {
             .borrow()
             .as_ref()
             .is_some_and(|(a, m)| a == "you" && min - *m <= 5);
+        let uid = next_uid();
         model_pick.push(Message {
             author: "you".into(),
             initial: initial("you"),
@@ -441,12 +502,19 @@ fn main() -> Result<(), slint::PlatformError> {
             color: color_of("you"),
             sticker: frames.frames.first().cloned().unwrap_or_default(),
             grouped,
+            uid,
         });
         *last_pick.borrow_mut() = Some(("you".to_string(), min));
-        let row = model_pick.row_count() - 1;
+        // A static (single-frame) sticker has nothing to animate.
         if frames.frames.len() > 1 {
-            let timer = spawn_sticker_timer(model_pick.clone(), row, frames);
-            timers_pick.borrow_mut().push(timer);
+            register_anim(
+                &ui_weak_pick,
+                &anims_pick,
+                &cursor_pick,
+                &timer_pick,
+                uid,
+                frames,
+            );
         }
     });
 
