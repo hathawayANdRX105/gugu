@@ -113,6 +113,11 @@ fn start_anim_loop(
     timer: Rc<Timer>,
 ) {
     let timer_c = timer.clone();
+    // Last published (uid, frame index): Slint property sets mark the window
+    // dirty even when the value is identical, and each needless dirty spins
+    // the render loop (measured 97% CPU on a single-frame sticker) — so the
+    // tick below publishes only when the displayed frame genuinely changes.
+    let last = Rc::new(Cell::new((-1i32, 0usize)));
     timer.start(
         TimerMode::Repeated,
         Duration::from_millis(20), // first tick is immediate-ish; the loop re-arms per frame
@@ -124,15 +129,22 @@ fn start_anim_loop(
             // Repeated timer from its own callback would leave the loop unable
             // to restart on a later registration, so it just idles instead.
             if rows.is_empty() {
-                globals.set_active_uid(-1);
+                if last.get().0 != -1 {
+                    globals.set_active_uid(-1);
+                    last.set((-1, 0));
+                }
                 return;
             }
             let i = cursor.get() % rows.len();
             let row = &mut rows[i];
-            globals.set_active_uid(row.uid);
-            globals.set_frame(row.frames.frames[row.idx].clone());
-            row.idx = (row.idx + 1) % row.frames.frames.len();
-            timer_c.set_interval(Duration::from_millis(row.frames.delays[row.idx]));
+            let next = (row.idx + 1) % row.frames.frames.len();
+            if (row.uid, next) != last.get() {
+                globals.set_active_uid(row.uid);
+                globals.set_frame(row.frames.frames[next].clone());
+                last.set((row.uid, next));
+            }
+            row.idx = next;
+            timer_c.set_interval(Duration::from_millis(row.frames.delays[next]));
             cursor.set((i + 1) % rows.len());
         },
     );
@@ -141,6 +153,9 @@ fn start_anim_loop(
 /// Register one row's animation. The loop is started lazily on the first
 /// registration and then runs for the window's lifetime; the round-robin
 /// cursor picks newly registered rows up on the next tick.
+///
+/// Single-frame stickers are skipped: `msg.sticker` already renders their
+/// only frame, and animating them would re-publish identical frames forever.
 fn register_anim(
     ui: &Weak<MainWindow>,
     anims: &Rc<RefCell<Vec<AnimRow>>>,
@@ -149,6 +164,9 @@ fn register_anim(
     uid: i32,
     frames: Rc<StickerFrames>,
 ) {
+    if frames.frames.len() <= 1 {
+        return;
+    }
     anims.borrow_mut().push(AnimRow {
         uid,
         frames,
