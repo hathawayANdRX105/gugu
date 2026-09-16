@@ -55,6 +55,14 @@ export struct Member {
     color: int,
 }
 
+// Delivery state of an outgoing message row. `retrying` is reserved for a
+// future per-attempt surface; v1 only ever displays sent/failed.
+export enum SendStatus {
+    sent,
+    retrying,
+    failed,
+}
+
 export struct Message {
     author: string,
     initial: string,
@@ -64,6 +72,8 @@ export struct Message {
     sticker: image,    // empty image = no sticker; the animation swaps frames in place
     grouped: bool,     // continuation of same author's group: body-only row, indented
     uid: int,          // stable row id, assigned once on insert and never re-assigned
+    client-id: int,    // == uid for outgoing rows; the send retry machinery echoes it back
+    status: SendStatus,
 }
 
 // One grid cell of the sticker picker: precomputed first-frame thumbnail
@@ -126,6 +136,14 @@ component MessageRow inherits Rectangle {
                 height: msg.sticker.width > 0 ? sticker-size : 0px;
                 image-fit: contain;
                 source: StickerAnim.active-uid == msg.uid ? StickerAnim.frame : msg.sticker;
+            }
+            // Send status: only surfaced when it isn't a plain success.
+            // Transitions are one-shot (at most two per row's lifetime), so
+            // an `if` here never feeds the per-frame redraw pump.
+            if msg.status != SendStatus.sent: Text {
+                text: msg.status == SendStatus.failed ? "发送失败" : "发送中…";
+                color: msg.status == SendStatus.failed ? #e74c3c : Palette.muted;
+                font-size: 11px;
             }
         }
     }

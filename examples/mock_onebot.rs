@@ -7,6 +7,8 @@
 //! `send_group_msg` (logging target and text), pushes a private message
 //! from a roster friend every 5s, and echoes every action to stderr.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +32,16 @@ const LINES: [&str; 3] = ["咕咕咕（mock）", "吃了吗？（mock）", "测�
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    let fail_first: usize = std::env::var("GUGU_SMOKE_SEND_FAIL_FIRST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // Counts send_* attempts across every connection: a fresh gugu run reconnects,
+    // and retry/final-failure scenarios must see a stable failure budget.
+    let fails = Arc::new(AtomicUsize::new(0));
+    if fail_first > 0 {
+        eprintln!("mock_onebot: injecting failure into the first {fail_first} send_* actions");
+    }
     let listener = TcpListener::bind("127.0.0.1:3001")
         .await
         .expect("mock_onebot: cannot bind 127.0.0.1:3001");
@@ -37,12 +49,14 @@ async fn main() {
     loop {
         let (stream, peer) = listener.accept().await.expect("accept failed");
         eprintln!("mock_onebot: {peer} connected");
-        tokio::spawn(serve(stream));
+        tokio::spawn(serve(stream, fails.clone(), fail_first));
     }
 }
 
-/// Drive one client connection until it goes away.
-async fn serve(stream: TcpStream) {
+/// Drive one client connection until it goes away. `fails` counts send_*
+/// attempts across connections so the injected failure budget survives
+/// reconnects; the first `fail_first` sends answer retcode 1200.
+async fn serve(stream: TcpStream, fails: Arc<AtomicUsize>, fail_first: usize) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
         eprintln!("mock_onebot: handshake failed");
         return;
@@ -114,10 +128,24 @@ async fn serve(stream: TcpStream) {
                             frame["params"]["group_id"].clone()
                         };
                         let text = frame["params"]["message"].as_str().unwrap_or("?");
-                        mid += 1;
-                        eprintln!("mock_onebot -> {action} to {target}: {text} (message_id {mid})");
-                        if sink.send(Message::Text(ok(&frame, json!({ "message_id": mid })).into())).await.is_err() {
-                            return;
+                        let count = fails.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count <= fail_first {
+                            eprintln!("mock_onebot -> {action} to {target}: INJECTED-FAIL ({count}/{fail_first})");
+                            let body = json!({
+                                "status": "failed",
+                                "retcode": 1200,
+                                "wording": "mock injected failure",
+                                "echo": frame["echo"],
+                            });
+                            if sink.send(Message::Text(body.to_string().into())).await.is_err() {
+                                return;
+                            }
+                        } else {
+                            mid += 1;
+                            eprintln!("mock_onebot -> {action} to {target}: {text} (message_id {mid})");
+                            if sink.send(Message::Text(ok(&frame, json!({ "message_id": mid })).into())).await.is_err() {
+                                return;
+                            }
                         }
                     }
                     _ => {}
