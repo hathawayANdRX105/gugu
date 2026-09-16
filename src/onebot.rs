@@ -84,7 +84,6 @@ pub enum Event {
     Connected,
     /// Private (`message_type == "private"`) message.
     PrivateMessage {
-        #[allow(dead_code)] // read once T5 sidebar wiring uses it; remove then
         sender_id: i64,
         sender_name: String,
         text: String,
@@ -92,10 +91,7 @@ pub enum Event {
     },
     /// Group (`message_type == "group"`) message.
     GroupMessage {
-        #[allow(dead_code)] // read once T5 sidebar wiring uses it; remove then
         group_id: i64,
-        #[allow(dead_code)] // read once T5 sidebar wiring uses it; remove then
-        sender_id: i64,
         sender_name: String,
         text: String,
         time: i64,
@@ -549,7 +545,6 @@ fn parse_event(v: &Value) -> Option<Event> {
         }),
         "group" => Some(Event::GroupMessage {
             group_id: v["group_id"].as_i64()?,
-            sender_id,
             sender_name,
             text,
             time,

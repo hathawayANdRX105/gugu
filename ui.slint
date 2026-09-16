@@ -47,6 +47,7 @@ export struct Channel {
     header: bool,      // section label row, not selectable
     peer_id: string,   // QQ id as string (i64 outlives slint's i32); "" = header/demo row
     is_group: bool,    // true → SendGroup, false → SendPrivate
+    unread: int,       // pending message count; 0 = none
 }
 
 export struct Member {
@@ -259,6 +260,18 @@ export component MainWindow inherits Window {
                                     font-size: ch.header ? 11px : 14px;
                                     font-weight: ch.header ? 700 : 600;
                                     vertical-alignment: center; x: 6px;
+                                }
+                                if ch.unread > 0: Rectangle {
+                                    x: parent.width - 42px; y: 7px;
+                                    width: 28px; height: 16px;
+                                    border-radius: 8px;
+                                    background: Palette.accent;
+                                    Text {
+                                        text: ch.unread > 99 ? "99+" : ch.unread;
+                                        color: white; font-size: 10px; font-weight: 700;
+                                        vertical-alignment: center; horizontal-alignment: center;
+                                        width: 100%; height: 100%;
+                                    }
                                 }
                             }
                         }

@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod convo;
 mod onebot;
 mod stickers;
 use stickers::{load_gif, scan_packs, StickerFrames, StickerPack};
@@ -177,32 +178,30 @@ fn register_anim(
     }
 }
 
-// Model + grouping state stashed for the onebot bridge. `Rc` is `!Send`,
-// so the transport thread's closure can't carry it; the
+// Message model + conversation store stashed for the onebot bridge.
+// `Rc` is `!Send`, so the transport thread's closure can't carry it; the
 // `invoke_from_event_loop` callback runs back on this (UI) thread and
 // picks the handles up here.
-type BridgeState = (Rc<VecModel<Message>>, Rc<RefCell<Option<(String, i64)>>>);
+type BridgeState = (Rc<VecModel<Message>>, Rc<RefCell<convo::Store<Message>>>);
 
 thread_local! {
     static BRIDGE: RefCell<Option<BridgeState>> = const { RefCell::new(None) };
 }
 
-/// Append one incoming OneBot message to the chat model. Same 5-minute
-/// same-author grouping rule as local sends; shares the `last` state via
-/// [`BRIDGE`] so incoming and outgoing rows merge consistently.
-fn push_incoming(author: &str, body: &str, unix: i64) {
+/// Append one incoming OneBot message to the active conversation's model
+/// (or its unread counter, if the user has since switched away). Grouping
+/// is per-conversation via [`convo::Store`]; demo-mode rows share the
+/// [`convo::ConvKey::DEMO`] bucket and behave exactly as before routing
+/// existed.
+fn push_incoming(key: convo::ConvKey, author: &str, body: &str, unix: i64) {
     // ponytail: UTC minute-of-day like now_minutes(); TZ handling is M4's.
     let min = unix / 60 % 1440;
     BRIDGE.with(|b| {
         let borrowed = b.borrow();
-        let Some((model, last)) = borrowed.as_ref() else {
+        let Some((model, store)) = borrowed.as_ref() else {
             return;
         };
-        let grouped = last
-            .borrow()
-            .as_ref()
-            .is_some_and(|(a, m)| a == author && (0..=5).contains(&(min - *m)));
-        model.push(Message {
+        let mut row = Message {
             author: author.into(),
             initial: initial(author),
             uid: next_uid(),
@@ -210,25 +209,46 @@ fn push_incoming(author: &str, body: &str, unix: i64) {
             time: fmt_time(min),
             color: color_of(author),
             sticker: slint::Image::default(),
-            grouped,
+            grouped: false,
             // Incoming rows are never send-tracked.
             client_id: 0,
             status: SendStatus::Sent,
-        });
-        *last.borrow_mut() = Some((author.to_string(), min));
+        };
+        let landed = store.borrow_mut().push(key, &mut row, author, min);
+        if landed {
+            model.push(row);
+        }
     });
 }
 
-/// Flip the send status of the row whose `uid == client_id`. One
+/// Flip the send status of the row whose `uid == client_id` in the
+/// conversation store — across all conversations, because the outcome may
+/// arrive after the user switched away. If that row is in the active
+/// conversation's displayed model, mirror the flip there too. One
 /// `set_row_data` per transition (at most two per row's lifetime); the
 /// animation path never touches the model, so this never feeds the
 /// per-frame redraw pump. No-op when the row is gone (e.g. after restart).
 fn set_send_status(client_id: i64, status: SendStatus) {
     BRIDGE.with(|b| {
         let borrowed = b.borrow();
-        let Some((model, _)) = borrowed.as_ref() else {
+        let Some((model, store)) = borrowed.as_ref() else {
             return;
         };
+        let mut found = false;
+        {
+            let mut store = store.borrow_mut();
+            for row in store.rows_mut() {
+                if row.uid as i64 == client_id {
+                    row.status = status;
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            return;
+        }
+        // The displayed model holds the active conversation's rows only; if
+        // the row is visible there, mirror the flip (bounded: one set_row_data).
         let mut i = 0;
         while i < model.row_count() {
             match model.row_data(i) {
@@ -240,6 +260,72 @@ fn set_send_status(client_id: i64, status: SendStatus) {
                 Some(_) => i += 1,
                 None => return,
             }
+        }
+    });
+}
+impl convo::HasRowMeta for Message {
+    fn set_grouped(&mut self, grouped: bool) {
+        self.grouped = grouped;
+    }
+}
+
+/// Conversation key for a sidebar row: the row's peer id, or
+/// [`convo::ConvKey::DEMO`] for header/demo rows that carry none.
+fn channel_key(ch: &Channel) -> convo::ConvKey {
+    match ch.peer_id.parse::<i64>() {
+        Ok(id) => convo::ConvKey {
+            id,
+            is_group: ch.is_group,
+        },
+        Err(_) => convo::ConvKey::DEMO,
+    }
+}
+/// Switch the displayed conversation: activate `idx`'s key in the store,
+/// clear its unread counter, and reflow the message model in place from
+/// the store's transcript. Row uids come from the store, so the animation
+/// loop's uid routing stays stable across the switch.
+fn select_conversation(
+    ui: &MainWindow,
+    model: &Rc<VecModel<Message>>,
+    store: &Rc<RefCell<convo::Store<Message>>>,
+    idx: i32,
+) {
+    let key = ui
+        .get_channels()
+        .row_data(idx.max(0) as usize)
+        .as_ref()
+        .map(channel_key)
+        .unwrap_or(convo::ConvKey::DEMO);
+    let rows: Vec<Message> = {
+        let mut st = store.borrow_mut();
+        st.set_active(key);
+        st.clear_unread(key);
+        st.entries(key).to_vec()
+    };
+    // ponytail: set_vec resets the model in one shot; uids come from the
+    // store, so the animation loop's row routing survives the switch.
+    model.set_vec(rows);
+}
+
+/// Republish unread counts on every sidebar row. Header rows stay at 0.
+fn refresh_unread(ui: &MainWindow, store: &Rc<RefCell<convo::Store<Message>>>) {
+    let channels = ui.get_channels();
+    for i in 0..channels.row_count() {
+        if let Some(mut ch) = channels.row_data(i) {
+            if !ch.header {
+                ch.unread = store.borrow().unread(channel_key(&ch)) as i32;
+                channels.set_row_data(i, ch);
+            }
+        }
+    }
+}
+/// [`refresh_unread`] for callers that only have the UI handle at hand:
+/// pulls the store out of the thread-local [`BRIDGE`]. No-op in demo mode,
+/// where the bridge is unregistered and there is no roster either.
+fn refresh_unread_via_bridge(ui: &MainWindow) {
+    BRIDGE.with(|b| {
+        if let Some((_, store)) = b.borrow().as_ref() {
+            refresh_unread(ui, store);
         }
     });
 }
@@ -275,6 +361,7 @@ fn main() -> Result<(), slint::PlatformError> {
         // Demo rows carry no peer id → sends stay local echo (see on_send).
         peer_id: "".into(),
         is_group: false,
+        unread: 0,
     })
     .collect();
     ui.set_channels(Rc::new(VecModel::from(channels)).into());
@@ -317,20 +404,19 @@ fn main() -> Result<(), slint::PlatformError> {
         load_gif(Path::new("assets/sticker.gif")).expect("bundled demo sticker must decode"),
     );
 
-    // Group rule (Discord/Revolt): same author AND gap <= 5 min merges;
-    // anything else reopens the group. Computed here, `.slint` only reads `grouped`.
+    // Demo transcript: one DEMO bucket in the store; grouping computed per
+    // conversation (here the whole transcript). Rows land in the model via
+    // the store, so the active/switch machinery below shares this data.
+    let store = Rc::new(RefCell::new(convo::Store::new()));
+    store.borrow_mut().set_active(convo::ConvKey::DEMO);
     let mut msgs: Vec<Message> = Vec::new();
     let mut sticker_uid = -1;
-    let mut last: Option<(String, i64)> = None;
     for (author, body, min, sticker) in mock {
-        let grouped = last
-            .as_ref()
-            .is_some_and(|(a, m)| a == *author && *min - m <= 5);
         let uid = next_uid();
         if *sticker {
             sticker_uid = uid;
         }
-        msgs.push(Message {
+        let mut row = Message {
             author: (*author).into(),
             initial: initial(author),
             body: (*body).into(),
@@ -341,13 +427,17 @@ fn main() -> Result<(), slint::PlatformError> {
             } else {
                 slint::Image::default()
             },
-            grouped,
+            grouped: false,
             uid,
             // Demo rows are never send-tracked.
             client_id: 0,
             status: SendStatus::Sent,
-        });
-        last = Some(((*author).to_string(), *min));
+        };
+        // Active DEMO bucket: push lands in-transcript; model gets the row too.
+        store
+            .borrow_mut()
+            .push(convo::ConvKey::DEMO, &mut row, author, *min);
+        msgs.push(row);
     }
     let model = Rc::new(VecModel::from(msgs));
     ui.set_messages(ModelRc::from(model.clone()));
@@ -355,10 +445,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // ---- send ----
     let ui_weak = ui.as_weak();
     let model_send = model.clone();
-    let last_send = Rc::new(RefCell::new(last));
-    // Text-send, sticker-pick and onebot events share one grouping state.
-    let last_sticker = last_send.clone();
-    let last_bridge = last_send.clone();
+    let store_send = store.clone();
+    let store_bridge = store.clone();
 
     // ---- onebot (M2): data/config.toml present → live events; absent → demo ----
     // Spawned before `on_send` so sends can address the selected peer. The
@@ -366,7 +454,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // means "configured"; actions queued while down drain on the next session.
     let ob_handle = Rc::new(match onebot::Config::load(Path::new("data/config.toml")) {
         Ok(config) => {
-            BRIDGE.with(|b| *b.borrow_mut() = Some((model.clone(), last_bridge)));
+            BRIDGE.with(|b| *b.borrow_mut() = Some((model.clone(), store_bridge)));
             let weak_ob = ui.as_weak();
             // on_event runs on the transport thread; only Send values may be
             // captured, so the event itself hops into the UI event loop and
@@ -383,20 +471,32 @@ fn main() -> Result<(), slint::PlatformError> {
                                 ui.set_conn_label(format!("已连接 · {nickname}").into());
                             }
                             onebot::Event::PrivateMessage {
-                                sender_name,
-                                text,
-                                time,
-                                ..
-                            }
-                            | onebot::Event::GroupMessage {
+                                sender_id,
                                 sender_name,
                                 text,
                                 time,
                                 ..
                             } => {
-                                // ponytail: still one shared transcript; per-conversation
-                                // routing by sender/group id is T6's.
-                                push_incoming(&sender_name, &text, time);
+                                let key = convo::ConvKey {
+                                    id: sender_id,
+                                    is_group: false,
+                                };
+                                push_incoming(key, &sender_name, &text, time);
+                                refresh_unread_via_bridge(&ui);
+                            }
+                            onebot::Event::GroupMessage {
+                                group_id,
+                                sender_name,
+                                text,
+                                time,
+                                ..
+                            } => {
+                                let key = convo::ConvKey {
+                                    id: group_id,
+                                    is_group: true,
+                                };
+                                push_incoming(key, &sender_name, &text, time);
+                                refresh_unread_via_bridge(&ui);
                             }
                             // T5: real friends/groups replace the mock sidebar. Two
                             // segments, header row first; QQ ids travel as strings
@@ -414,17 +514,24 @@ fn main() -> Result<(), slint::PlatformError> {
                                         header: true,
                                         peer_id: "".into(),
                                         is_group: false,
+                                        unread: 0,
                                     });
                                     rows.extend(seg.into_iter().map(|p| Channel {
                                         name: p.name.as_str().into(),
                                         header: false,
                                         peer_id: p.id.to_string().into(),
                                         is_group: p.is_group,
+                                        unread: 0,
                                     }));
                                 }
                                 let first = rows.iter().position(|r| !r.header).unwrap_or(0) as i32;
                                 ui.set_channels(Rc::new(VecModel::from(rows)).into());
                                 ui.set_selected(first);
+                                BRIDGE.with(|b| {
+                                    if let Some((model, store)) = b.borrow().as_ref() {
+                                        select_conversation(&ui, model, store, first);
+                                    }
+                                });
                             }
                             // Send retry bookkeeping: route the outcome back
                             // to the row that sent it (uid == client_id).
@@ -465,6 +572,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let target = ui
             .get_channels()
             .row_data(ui.get_selected().max(0) as usize);
+        let key = target
+            .as_ref()
+            .map(channel_key)
+            .unwrap_or(convo::ConvKey::DEMO);
         if let (Some(ob), Some(ch)) = (ob_send.as_ref(), target) {
             if let Ok(peer_id) = ch.peer_id.parse::<i64>() {
                 ob.send(if ch.is_group {
@@ -483,31 +594,35 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         }
         let min = now_minutes();
-        let grouped = last_send
-            .borrow()
-            .as_ref()
-            .is_some_and(|(a, m)| a == "you" && min - *m <= 5);
-        model_send.push(Message {
+        let mut row = Message {
             author: "you".into(),
             initial: initial("you"),
             body: draft.into(),
             time: fmt_time(min),
             color: color_of("you"),
             sticker: slint::Image::default(),
-            grouped,
+            grouped: false,
             uid: send_uid,
             client_id: send_uid,
             status: SendStatus::Sent,
-        });
-        *last_send.borrow_mut() = Some(("you".to_string(), min));
+        };
+        // Outbound rows land in the selected conversation: active → the
+        // displayed model too; the store owns the grouping decision.
+        let landed = store_send.borrow_mut().push(key, &mut row, "you", min);
+        if landed {
+            model_send.push(row);
+        }
         ui.set_draft("".into());
     });
 
     // ---- channel select ----
     let ui_weak2 = ui.as_weak();
+    let model_sel = model.clone();
+    let store_sel = store.clone();
     ui.on_select_channel(move |idx| {
         if let Some(ui) = ui_weak2.upgrade() {
             ui.set_selected(idx);
+            select_conversation(&ui, &model_sel, &store_sel, idx);
         }
     });
 
@@ -543,12 +658,12 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
     let model_pick = model.clone();
+    let store_pick = store.clone();
     let packs_pick = packs.clone();
     let anims_pick = anims.clone();
     let cursor_pick = anim_cursor.clone();
     let timer_pick = anim_timer.clone();
     let ui_weak_pick = ui.as_weak();
-    let last_pick = last_sticker;
     ui.on_pick_sticker(move |pack, index| {
         // scan_packs never fails; a bad index just drops the click.
         let Some((_, decoded)) = packs_pick
@@ -560,26 +675,28 @@ fn main() -> Result<(), slint::PlatformError> {
         let frames = Rc::new(decoded.clone());
 
         let min = now_minutes();
-        let grouped = last_pick
-            .borrow()
-            .as_ref()
-            .is_some_and(|(a, m)| a == "you" && min - *m <= 5);
         let uid = next_uid();
-        model_pick.push(Message {
+        let mut row = Message {
             author: "you".into(),
             initial: initial("you"),
             body: "".into(),
             time: fmt_time(min),
             color: color_of("you"),
             sticker: frames.frames.first().cloned().unwrap_or_default(),
-            grouped,
+            grouped: false,
             uid,
             // Local sticker picks are never send-tracked (image channel is
             // batch seven; once it ships, picked stickers go through it).
             client_id: 0,
             status: SendStatus::Sent,
-        });
-        *last_pick.borrow_mut() = Some(("you".to_string(), min));
+        };
+        // Picked stickers belong to the active conversation; the store
+        // decides grouping, and the landed row joins the displayed model.
+        let active = store_pick.borrow().active().unwrap_or(convo::ConvKey::DEMO);
+        let landed = store_pick.borrow_mut().push(active, &mut row, "you", min);
+        if landed {
+            model_pick.push(row);
+        }
         // A static (single-frame) sticker has nothing to animate.
         if frames.frames.len() > 1 {
             register_anim(
@@ -602,7 +719,7 @@ fn main() -> Result<(), slint::PlatformError> {
             .unwrap_or_default()
             .as_secs() as i64;
         ui.set_conn_label("已连接 · smoke".into());
-        push_incoming("smoke", "onebot 桥接自检消息", secs);
+        push_incoming(convo::ConvKey::DEMO, "smoke", "onebot 桥接自检消息", secs);
     }
 
     // Smoke seam (AGENTS 测试分层: 启动 + grim + 帧差): GUGU_SMOKE opens the

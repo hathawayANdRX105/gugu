@@ -4,8 +4,9 @@
 //! import its modules. Run this, point `data/config.toml`'s `ws_url` at it,
 //! start gugu — it answers `get_login_info`, `get_friend_list` and
 //! `get_group_list` with a mock roster, acks `send_private_msg` /
-//! `send_group_msg` (logging target and text), pushes a private message
-//! from a roster friend every 5s, and echoes every action to stderr.
+//! `send_group_msg` (logging target and text), pushes a private and a group
+//! message from roster friends in turn every `GUGU_SMOKE_PUSH_INTERVAL_MS`
+//! (default 5s, floor 200ms), and echoes every action to stderr.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -53,6 +54,20 @@ async fn main() {
     }
 }
 
+/// Push cadence from `GUGU_SMOKE_PUSH_INTERVAL_MS`: default 5s, unparseable
+/// values fall back to it, anything below 200ms is clamped up so a typo
+/// cannot flood the client.
+fn push_interval() -> Duration {
+    const DEFAULT_MS: u64 = 5000;
+    const FLOOR_MS: u64 = 200;
+    let ms = std::env::var("GUGU_SMOKE_PUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS)
+        .max(FLOOR_MS);
+    Duration::from_millis(ms)
+}
+
 /// Drive one client connection until it goes away. `fails` counts send_*
 /// attempts across connections so the injected failure budget survives
 /// reconnects; the first `fail_first` sends answer retcode 1200.
@@ -62,7 +77,7 @@ async fn serve(stream: TcpStream, fails: Arc<AtomicUsize>, fail_first: usize) {
         return;
     };
     let (mut sink, mut src) = ws.split();
-    let mut push = tokio::time::interval(Duration::from_secs(5));
+    let mut push = tokio::time::interval(push_interval());
     let mut line = 0usize;
     let mut mid = 0u64;
     loop {
@@ -71,18 +86,39 @@ async fn serve(stream: TcpStream, fails: Arc<AtomicUsize>, fail_first: usize) {
                 let (fid, fname, _) = FRIENDS[line % FRIENDS.len()];
                 let text = LINES[line % LINES.len()];
                 line += 1;
-                let event = json!({
-                    "time": SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64),
-                    "self_id": BOT.0,
-                    "post_type": "message",
-                    "message_type": "private",
-                    "sub_type": "friend",
-                    "message_id": line,
-                    "font": 14,
-                    "sender": { "user_id": fid, "nickname": fname, "card": "", "sex": "unknown", "age": 0, "level": "5" },
-                    "message": text,
-                    "raw_message": text,
-                });
+                let time = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+                // Alternate private and group so a smoke run sees both routes:
+                // odd pushes go to the first roster group.
+                let group = line.is_multiple_of(2);
+                let event = if group {
+                    eprintln!("mock_onebot -> group message from {fname} in {}: {text}", GROUPS[0].0);
+                    json!({
+                        "time": time,
+                        "self_id": BOT.0,
+                        "post_type": "message",
+                        "message_type": "group",
+                        "sub_type": "normal",
+                        "anonymous": null,
+                        "group_id": GROUPS[0].0,
+                        "message_id": line,
+                        "font": 14,
+                        "sender": { "user_id": fid, "nickname": fname, "card": "", "sex": "unknown", "age": 0, "level": "5" },
+                        "message": text,
+                    })
+                } else {
+                    json!({
+                        "time": time,
+                        "self_id": BOT.0,
+                        "post_type": "message",
+                        "message_type": "private",
+                        "sub_type": "friend",
+                        "message_id": line,
+                        "font": 14,
+                        "sender": { "user_id": fid, "nickname": fname, "card": "", "sex": "unknown", "age": 0, "level": "5" },
+                        "message": text,
+                        "raw_message": text,
+                    })
+                };
                 if sink.send(Message::Text(event.to_string().into())).await.is_err() {
                     eprintln!("mock_onebot: client gone, push failed");
                     return;
