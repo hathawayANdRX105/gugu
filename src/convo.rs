@@ -1,7 +1,3 @@
-// ponytail: main.rs wiring (Store use) lands in S2; until then the bin sees
-// these pub items as unused. Drop this allow once main.rs consumes convo.
-#![allow(dead_code)]
-
 //! Conversation-routing pure logic: per-peer message transcripts, grouping,
 //! and unread counts. Deliberately UI-free — rows are plain data converted
 //! to Slint messages by `main.rs`, which keeps this module unit-testable
@@ -24,22 +20,6 @@ impl ConvKey {
         id: 0,
         is_group: false,
     };
-}
-
-/// One message row: UI-agnostic plain data. `main.rs` converts rows to
-/// Slint `Message` values when (re)filling the displayed model.
-#[derive(Debug, Clone)]
-pub struct Row {
-    pub author: String,
-    pub body: String,
-    /// Local wall-clock minute of day (unix / 60 % 1440).
-    pub minute: i64,
-    /// Continuation of the same author's group within [`GROUP_GAP_MIN`].
-    pub grouped: bool,
-    pub uid: i32,
-    /// Send-retry correlation id (== uid for outgoing rows, 0 otherwise).
-    pub client_id: i64,
-    pub sticker: Option<slint::Image>,
 }
 
 /// Minutes after which the same author starts a new message group.
