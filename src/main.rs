@@ -14,6 +14,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod convo;
 mod onebot;
 mod stickers;
 use stickers::{load_gif, scan_packs, StickerFrames, StickerPack};
