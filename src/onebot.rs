@@ -7,6 +7,7 @@
 //! and the `on_event` callback (events out); bridging into Slint
 //! (`invoke_from_event_loop`) is the caller's job.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -24,6 +25,15 @@ const BACKOFF: [Duration; 4] = [
     Duration::from_secs(10),
 ];
 
+/// Maximum total attempts per tracked send, first send included. Exhausting
+/// them emits [`Event::SendFailed`] — no automatic resend after that (the
+/// message may already have reached QQ; duplicates are worse than a visible
+/// failure the user can retry manually).
+const MAX_ATTEMPTS: u32 = 3;
+/// Delay between send retries: a failed/timed-out attempt is re-sent after
+/// this long. Also the inflight polling cadence that catches timeouts.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Connection settings (loaded from `data/config.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -31,6 +41,15 @@ pub struct Config {
     pub ws_url: String,
     /// `access_token`; appended to `ws_url` as a query parameter. Empty = no auth.
     pub access_token: String,
+    /// Per-attempt send timeout in milliseconds. A send that gets no reply
+    /// within this window is retried (up to [`MAX_ATTEMPTS`]). Defaults to 5s;
+    /// tests shrink it to keep timeout paths fast.
+    #[serde(default = "default_send_timeout_ms")]
+    pub send_timeout_ms: u64,
+}
+
+fn default_send_timeout_ms() -> u64 {
+    5000
 }
 
 impl Config {
@@ -84,14 +103,31 @@ pub enum Event {
     /// Merged `get_friend_list` + `get_group_list` reply, pulled
     /// automatically after each (re)connection. Friends first, groups after.
     Roster { peers: Vec<Peer> },
+    /// A tracked send succeeded: the protocol end answered `retcode == 0`
+    /// with `data.message_id`. `client_id` is the caller-supplied row id.
+    SendOk { client_id: i64, message_id: i64 },
+    /// A tracked send exhausted its attempts (repeated failures/timeouts) or
+    /// the connection dropped while it was in flight. Emitted exactly once
+    /// per send; no automatic resend (avoids duplicate QQ messages).
+    SendFailed { client_id: i64 },
 }
 
 /// Action accepted on [`Handle::send`]; serialized to a OneBot v11 frame.
+#[derive(Debug, Clone)]
 pub enum Action {
-    /// `send_private_msg`
-    SendPrivate { user_id: i64, text: String },
-    /// `send_group_msg`
-    SendGroup { group_id: i64, text: String },
+    /// `send_private_msg`; `client_id` is the caller's row id, echoed back
+    /// on [`Event::SendOk`]/[`Event::SendFailed`].
+    SendPrivate {
+        client_id: i64,
+        user_id: i64,
+        text: String,
+    },
+    /// `send_group_msg`; `client_id` as in [`Action::SendPrivate`].
+    SendGroup {
+        client_id: i64,
+        group_id: i64,
+        text: String,
+    },
     /// `get_login_info`
     GetLoginInfo,
     /// expands to a `get_friend_list` + `get_group_list` frame pair; the
@@ -161,6 +197,7 @@ async fn run(config: Config, rx: Receiver<Action>, on_event: Box<dyn Fn(Event) +
     });
 
     let url = authed_url(&config);
+    let send_timeout = Duration::from_millis(config.send_timeout_ms);
     let mut attempt = 0usize;
     let mut echo: i64 = 0;
     loop {
@@ -169,7 +206,15 @@ async fn run(config: Config, rx: Receiver<Action>, on_event: Box<dyn Fn(Event) +
                 attempt = 0;
                 on_event(Event::Connected);
                 let (sink, stream) = ws.split();
-                session(sink, stream, &mut arx, on_event.as_ref(), &mut echo).await;
+                session(
+                    sink,
+                    stream,
+                    &mut arx,
+                    on_event.as_ref(),
+                    &mut echo,
+                    send_timeout,
+                )
+                .await;
             }
             Err(e) => eprintln!("onebot: connect {url} failed: {e}"),
         }
@@ -182,52 +227,6 @@ async fn run(config: Config, rx: Receiver<Action>, on_event: Box<dyn Fn(Event) +
 /// The socket pair after `connect_async` + `split`.
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// One connected session: pump frames both ways until socket error/close.
-async fn session(
-    mut sink: futures_util::stream::SplitSink<Ws, Message>,
-    mut stream: futures_util::stream::SplitStream<Ws>,
-    arx: &mut tokio::sync::mpsc::UnboundedReceiver<Action>,
-    on_event: &(dyn Fn(Event) + Send),
-    echo: &mut i64,
-) {
-    let mut slots = ReplySlots::default();
-    // The connect path always asks who we are, then pulls the roster.
-    send_action(&mut sink, Action::GetLoginInfo, echo, &mut slots).await;
-    send_action(&mut sink, Action::GetRoster, echo, &mut slots).await;
-    loop {
-        tokio::select! {
-            item = stream.next() => {
-                let msg = match item {
-                    Some(Ok(m)) => m,
-                    _ => return, // close, error, or stream end
-                };
-                if !matches!(msg, Message::Text(_)) {
-                    continue; // ping/pong handled by tungstenite; OneBot WS is JSON text
-                }
-                let txt = msg.to_string();
-                let Ok(v) = serde_json::from_str::<Value>(&txt) else {
-                    eprintln!("onebot: bad JSON frame: {}", txt.chars().take(120).collect::<String>());
-                    continue;
-                };
-                let ev = if v.get("post_type").is_some() {
-                    parse_event(&v)
-                } else if v.get("echo").is_some() {
-                    parse_reply(&v, &mut slots)
-                } else {
-                    None // meta_event / heartbeat etc.
-                };
-                if let Some(ev) = ev {
-                    on_event(ev);
-                }
-            }
-            action = arx.recv() => {
-                let Some(action) = action else { return }; // sender dropped
-                send_action(&mut sink, action, echo, &mut slots).await;
-            }
-        }
-    }
-}
 
 /// Write one action frame with a fresh echo (per-connection string of the
 /// monotonic counter) and return it, so callers can record reply matching.
@@ -246,22 +245,245 @@ async fn send_one(
     id
 }
 
+/// One tracked send awaiting its reply.
+struct Inflight {
+    /// Caller-supplied row id, echoed back on SendOk/SendFailed.
+    client_id: i64,
+    /// Original action, re-sent verbatim on retry.
+    action: Action,
+    /// Total attempts made so far (1 = first send).
+    attempts: u32,
+    /// When the current attempt times out.
+    deadline: tokio::time::Instant,
+}
+
+/// One connected session: pump frames both ways until socket error/close.
+///
+/// Send-class actions are tracked in an inflight table keyed by echo: a
+/// reply with `retcode == 0` completes the send ([`Event::SendOk`]), a
+/// failure reply or a [`RETRY_DELAY`] deadline expiry triggers a resend
+/// (up to [`MAX_ATTEMPTS`] total attempts), and exhaustion or disconnect
+/// emits [`Event::SendFailed`]. Query replies (login/roster) keep flowing
+/// through [`parse_reply`].
+async fn session(
+    mut sink: futures_util::stream::SplitSink<Ws, Message>,
+    mut stream: futures_util::stream::SplitStream<Ws>,
+    arx: &mut tokio::sync::mpsc::UnboundedReceiver<Action>,
+    on_event: &(dyn Fn(Event) + Send),
+    echo: &mut i64,
+    send_timeout: Duration,
+) {
+    let mut slots = ReplySlots::default();
+    let mut inflight: HashMap<String, Inflight> = HashMap::new();
+    // The connect path always asks who we are, then pulls the roster.
+    send_action(
+        &mut sink,
+        Action::GetLoginInfo,
+        echo,
+        &mut slots,
+        &mut inflight,
+        send_timeout,
+        1,
+    )
+    .await;
+    send_action(
+        &mut sink,
+        Action::GetRoster,
+        echo,
+        &mut slots,
+        &mut inflight,
+        send_timeout,
+        1,
+    )
+    .await;
+    let mut retry_tick = tokio::time::interval(RETRY_DELAY);
+    loop {
+        tokio::select! {
+            item = stream.next() => {
+                let Some(Ok(m)) = item else {
+                    break; // close, error, or stream end
+                };
+                if matches!(m, Message::Close(_)) {
+                    // Peer-initiated close: end the session. In-flight sends
+                    // are failed by the drain below — a reconnect may resend
+                    // nothing (the original could already be delivered).
+                    break;
+                }
+                if !matches!(m, Message::Text(_)) {
+                    continue; // ping/pong handled by tungstenite; OneBot WS is JSON text
+                }
+                let txt = m.to_string();
+                let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+                    eprintln!("onebot: bad JSON frame: {}", txt.chars().take(120).collect::<String>());
+                    continue;
+                };
+                let ev = if v.get("post_type").is_some() {
+                    parse_event(&v)
+                } else if let Some(echo_str) = v["echo"].as_str().map(str::to_string) {
+                    // Send-class replies are matched against inflight first;
+                    // unknown echoes fall through to the query-reply parser.
+                    match inflight.remove(&echo_str) {
+                        Some(inf) => {
+                            let retcode = v["retcode"].as_i64().unwrap_or(-1);
+                            if retcode == 0 {
+                                Some(Event::SendOk {
+                                    client_id: inf.client_id,
+                                    message_id: v["data"]["message_id"].as_i64().unwrap_or(0),
+                                })
+                            } else if inf.attempts < MAX_ATTEMPTS {
+                                eprintln!(
+                                    "onebot: send retry {}/{} for client {} (retcode {retcode})",
+                                    inf.attempts + 1,
+                                    MAX_ATTEMPTS,
+                                    inf.client_id
+                                );
+                                send_action(
+                                    &mut sink,
+                                    inf.action,
+                                    echo,
+                                    &mut slots,
+                                    &mut inflight,
+                                    send_timeout,
+                                    inf.attempts + 1,
+                                )
+                                .await;
+                                None
+                            } else {
+                                eprintln!(
+                                    "onebot: send failed for client {} after {MAX_ATTEMPTS} attempts (retcode {retcode})",
+                                    inf.client_id
+                                );
+                                Some(Event::SendFailed { client_id: inf.client_id })
+                            }
+                        }
+                        None => parse_reply(&v, &mut slots),
+                    }
+                } else {
+                    None // meta_event / heartbeat etc.
+                };
+                if let Some(ev) = ev {
+                    on_event(ev);
+                }
+            }
+            action = arx.recv() => {
+                let Some(action) = action else { break }; // sender dropped
+                send_action(
+                    &mut sink,
+                    action,
+                    echo,
+                    &mut slots,
+                    &mut inflight,
+                    send_timeout,
+                    1,
+                )
+                .await;
+            }
+            _ = retry_tick.tick() => {
+                // Timeout sweep: expired entries either resend (fresh
+                // deadline) or fail for good.
+                let now = tokio::time::Instant::now();
+                let expired: Vec<String> = inflight
+                    .iter()
+                    .filter(|(_, inf)| now >= inf.deadline)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for id in expired {
+                    let inf = inflight.remove(&id).expect("just checked");
+                    if inf.attempts < MAX_ATTEMPTS {
+                        eprintln!(
+                            "onebot: send retry {}/{} for client {} (timeout)",
+                            inf.attempts + 1,
+                            MAX_ATTEMPTS,
+                            inf.client_id
+                        );
+                        send_action(
+                            &mut sink,
+                            inf.action,
+                            echo,
+                            &mut slots,
+                            &mut inflight,
+                            send_timeout,
+                            inf.attempts + 1,
+                        )
+                        .await;
+                    } else {
+                        eprintln!(
+                            "onebot: send failed for client {} after {MAX_ATTEMPTS} attempts (timeout)",
+                            inf.client_id
+                        );
+                        on_event(Event::SendFailed { client_id: inf.client_id });
+                    }
+                }
+            }
+        }
+    }
+    // Disconnect path: in-flight sends must not be blindly re-sent after a
+    // reconnect (the original attempt may already have reached QQ), so the
+    // UI sees a visible failure it can retry manually.
+    for inf in inflight.into_values() {
+        on_event(Event::SendFailed {
+            client_id: inf.client_id,
+        });
+    }
+}
+
 /// Serialize one action and write it: [`Action::GetRoster`] expands to the
 /// two list requests; echoes whose replies are consumed land in `slots`.
+/// Send-class actions are additionally recorded in `inflight` (keyed by the
+/// fresh echo) with `attempts` and a `send_timeout` deadline, driving the
+/// retry/failure machinery in [`session`]. `attempts` is ignored for the
+/// query actions.
 async fn send_action(
     sink: &mut futures_util::stream::SplitSink<Ws, Message>,
     action: Action,
     echo: &mut i64,
     slots: &mut ReplySlots,
+    inflight: &mut HashMap<String, Inflight>,
+    send_timeout: Duration,
+    attempts: u32,
 ) {
     match action {
-        Action::SendPrivate { user_id, text } => {
+        Action::SendPrivate {
+            client_id,
+            user_id,
+            text,
+        } => {
             let params = json!({ "user_id": user_id, "message": text });
-            send_one(sink, "send_private_msg", params, echo).await;
+            let id = send_one(sink, "send_private_msg", params, echo).await;
+            inflight.insert(
+                id,
+                Inflight {
+                    client_id,
+                    action: Action::SendPrivate {
+                        client_id,
+                        user_id,
+                        text,
+                    },
+                    attempts,
+                    deadline: tokio::time::Instant::now() + send_timeout,
+                },
+            );
         }
-        Action::SendGroup { group_id, text } => {
+        Action::SendGroup {
+            client_id,
+            group_id,
+            text,
+        } => {
             let params = json!({ "group_id": group_id, "message": text });
-            send_one(sink, "send_group_msg", params, echo).await;
+            let id = send_one(sink, "send_group_msg", params, echo).await;
+            inflight.insert(
+                id,
+                Inflight {
+                    client_id,
+                    action: Action::SendGroup {
+                        client_id,
+                        group_id,
+                        text,
+                    },
+                    attempts,
+                    deadline: tokio::time::Instant::now() + send_timeout,
+                },
+            );
         }
         Action::GetLoginInfo => {
             slots.login = Some(send_one(sink, "get_login_info", json!({}), echo).await);
@@ -553,10 +775,13 @@ mod tests {
     }
 
     /// Start the real transport against an in-process WS server and accept
-    /// one connection. Returns the action handle, the server-side socket
+    /// one connection. `send_timeout_ms` is caller-chosen so timeout-path
+    /// tests run fast. Returns the action handle, the server-side socket
     /// halves, and the event callback receiver. The listener is dropped
     /// after accept; later reconnects fail fast, which is fine per-test.
-    async fn loopback() -> (
+    async fn loopback_with_timeout(
+        send_timeout_ms: u64,
+    ) -> (
         Handle,
         futures_util::stream::SplitSink<Ws, Message>,
         futures_util::stream::SplitStream<Ws>,
@@ -569,6 +794,7 @@ mod tests {
             Config {
                 ws_url: format!("ws://{addr}/onebot"),
                 access_token: "sekret".into(),
+                send_timeout_ms,
             },
             Box::new(move |e| {
                 let _ = tx.send(e);
@@ -587,6 +813,16 @@ mod tests {
         .unwrap();
         let (sink, src) = ws.split();
         (handle, sink, src, rx)
+    }
+
+    /// Default-timeout loopback used by the pre-existing roundtrip tests.
+    async fn loopback() -> (
+        Handle,
+        futures_util::stream::SplitSink<Ws, Message>,
+        futures_util::stream::SplitStream<Ws>,
+        std::sync::mpsc::Receiver<Event>,
+    ) {
+        loopback_with_timeout(5000).await
     }
 
     /// Full loopback: real WS server in-process, real transport thread.
@@ -628,6 +864,7 @@ mod tests {
 
         // Actions queued on the Handle come out as OneBot frames.
         handle.send(Action::SendPrivate {
+            client_id: 7,
             user_id: 42,
             text: "hi".into(),
         });
@@ -802,5 +1039,231 @@ mod tests {
         }
         // Exactly one Roster: the halves were consumed by the merge.
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    /// Server fails the first send (retcode≠0) and succeeds the second:
+    /// the retry machinery must deliver exactly one SendOk and the server
+    /// must see exactly two send frames.
+    #[tokio::test]
+    async fn send_retries_then_succeeds() {
+        let (handle, mut sink, mut src, rx) = loopback_with_timeout(5000).await;
+        let login_echo = next_frame(&mut src).await["echo"].clone();
+        next_frame(&mut src).await; // get_friend_list
+        next_frame(&mut src).await; // get_group_list
+        let reply = json!({
+            "status": "ok", "retcode": 0, "echo": login_echo,
+            "data": { "user_id": 10001, "nickname": "smoke" }
+        });
+        sink.send(Message::Text(reply.to_string().into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(Event::Connected)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(Event::Login { .. })
+        ));
+
+        handle.send(Action::SendPrivate {
+            client_id: 42,
+            user_id: 1,
+            text: "hi".into(),
+        });
+        // Attempt 1 → injected failure.
+        let f = next_frame(&mut src).await;
+        assert_eq!(f["action"], "send_private_msg");
+        let fail = json!({ "status": "failed", "retcode": 1200, "echo": f["echo"] });
+        sink.send(Message::Text(fail.to_string().into()))
+            .await
+            .unwrap();
+        // Attempt 2 → success.
+        let f = next_frame(&mut src).await;
+        assert_eq!(f["action"], "send_private_msg");
+        let ok = json!({
+            "status": "ok", "retcode": 0, "echo": f["echo"],
+            "data": { "message_id": 7 }
+        });
+        sink.send(Message::Text(ok.to_string().into()))
+            .await
+            .unwrap();
+
+        let e = rx.recv_timeout(Duration::from_secs(10)).expect("no SendOk");
+        match e {
+            Event::SendOk {
+                client_id,
+                message_id,
+            } => {
+                assert_eq!((client_id, message_id), (42, 7));
+            }
+            other => panic!("expected SendOk, got {other:?}"),
+        }
+        // Exactly one extra event must not arrive (no spurious retries).
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+    }
+
+    /// A send that fails MAX_ATTEMPTS times ends in exactly one SendFailed,
+    /// with the server having seen precisely MAX_ATTEMPTS frames.
+    #[tokio::test]
+    async fn send_fails_after_max_attempts() {
+        let (handle, mut sink, mut src, rx) = loopback_with_timeout(5000).await;
+        let login_echo = next_frame(&mut src).await["echo"].clone();
+        next_frame(&mut src).await;
+        next_frame(&mut src).await;
+        let reply = json!({
+            "status": "ok", "retcode": 0, "echo": login_echo,
+            "data": { "user_id": 10001, "nickname": "smoke" }
+        });
+        sink.send(Message::Text(reply.to_string().into()))
+            .await
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Connected
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Login
+
+        handle.send(Action::SendGroup {
+            client_id: 9,
+            group_id: 30001,
+            text: "hello".into(),
+        });
+        let mut send_frames = 0;
+        for _ in 0..MAX_ATTEMPTS {
+            let f = next_frame(&mut src).await;
+            assert_eq!(f["action"], "send_group_msg");
+            send_frames += 1;
+            let fail = json!({ "status": "failed", "retcode": 1200, "echo": f["echo"] });
+            sink.send(Message::Text(fail.to_string().into()))
+                .await
+                .unwrap();
+        }
+        let e = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no SendFailed");
+        match e {
+            Event::SendFailed { client_id } => assert_eq!(client_id, 9),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+        assert_eq!(send_frames, MAX_ATTEMPTS as i32);
+    }
+
+    /// A server that accepts frames but never answers drives the timeout
+    /// path: MAX_ATTEMPTS sends, then SendFailed. Uses a short
+    /// send_timeout_ms so the whole cycle runs in seconds.
+    #[tokio::test]
+    async fn send_timeout_retries_then_fails() {
+        let (handle, mut sink, mut src, rx) = loopback_with_timeout(300).await;
+        let login_echo = next_frame(&mut src).await["echo"].clone();
+        next_frame(&mut src).await;
+        next_frame(&mut src).await;
+        let reply = json!({
+            "status": "ok", "retcode": 0, "echo": login_echo,
+            "data": { "user_id": 10001, "nickname": "smoke" }
+        });
+        sink.send(Message::Text(reply.to_string().into()))
+            .await
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Connected
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Login
+
+        handle.send(Action::SendPrivate {
+            client_id: 5,
+            user_id: 2,
+            text: "echo me not".into(),
+        });
+        // The server must see MAX_ATTEMPTS sends; nothing is ever answered.
+        for _ in 0..MAX_ATTEMPTS {
+            let f = next_frame(&mut src).await;
+            assert_eq!(f["action"], "send_private_msg");
+        }
+        let e = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no SendFailed");
+        match e {
+            Event::SendFailed { client_id } => assert_eq!(client_id, 5),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+    }
+
+    /// A server that reads one send frame and then drops the connection
+    /// must surface a SendFailed for the in-flight send (no silent loss,
+    /// no automatic resend after reconnect).
+    #[tokio::test]
+    async fn send_disconnect_fails_inflight() {
+        let (handle, mut sink, mut src, rx) = loopback_with_timeout(5000).await;
+        let login_echo = next_frame(&mut src).await["echo"].clone();
+        next_frame(&mut src).await;
+        next_frame(&mut src).await;
+        let reply = json!({
+            "status": "ok", "retcode": 0, "echo": login_echo,
+            "data": { "user_id": 10001, "nickname": "smoke" }
+        });
+        sink.send(Message::Text(reply.to_string().into()))
+            .await
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Connected
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Login
+
+        handle.send(Action::SendPrivate {
+            client_id: 11,
+            user_id: 3,
+            text: "into the void".into(),
+        });
+        let f = next_frame(&mut src).await;
+        assert_eq!(f["action"], "send_private_msg");
+        // Drop the server side: the session ends, in-flight sends fail.
+        sink.close().await.unwrap();
+        let e = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no SendFailed");
+        match e {
+            Event::SendFailed { client_id } => assert_eq!(client_id, 11),
+            other => panic!("expected SendFailed, got {other:?}"),
+        }
+    }
+
+    /// The happy path: one send frame, one retcode-0 reply, exactly one
+    /// SendOk carrying the server's message_id — and no retry frames.
+    #[tokio::test]
+    async fn send_ok_first_try() {
+        let (handle, mut sink, mut src, rx) = loopback_with_timeout(5000).await;
+        let login_echo = next_frame(&mut src).await["echo"].clone();
+        next_frame(&mut src).await;
+        next_frame(&mut src).await;
+        let reply = json!({
+            "status": "ok", "retcode": 0, "echo": login_echo,
+            "data": { "user_id": 10001, "nickname": "smoke" }
+        });
+        sink.send(Message::Text(reply.to_string().into()))
+            .await
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Connected
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(); // Login
+
+        handle.send(Action::SendPrivate {
+            client_id: 3,
+            user_id: 4,
+            text: "clean".into(),
+        });
+        let f = next_frame(&mut src).await;
+        assert_eq!(f["action"], "send_private_msg");
+        let ok = json!({
+            "status": "ok", "retcode": 0, "echo": f["echo"],
+            "data": { "message_id": 42 }
+        });
+        sink.send(Message::Text(ok.to_string().into()))
+            .await
+            .unwrap();
+        let e = rx.recv_timeout(Duration::from_secs(10)).expect("no SendOk");
+        match e {
+            Event::SendOk {
+                client_id,
+                message_id,
+            } => {
+                assert_eq!((client_id, message_id), (3, 42));
+            }
+            other => panic!("expected SendOk, got {other:?}"),
+        }
+        // No retry frames may follow a clean success.
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
     }
 }

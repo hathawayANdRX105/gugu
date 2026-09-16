@@ -211,10 +211,39 @@ fn push_incoming(author: &str, body: &str, unix: i64) {
             color: color_of(author),
             sticker: slint::Image::default(),
             grouped,
+            // Incoming rows are never send-tracked.
+            client_id: 0,
+            status: SendStatus::Sent,
         });
         *last.borrow_mut() = Some((author.to_string(), min));
     });
 }
+
+/// Flip the send status of the row whose `uid == client_id`. One
+/// `set_row_data` per transition (at most two per row's lifetime); the
+/// animation path never touches the model, so this never feeds the
+/// per-frame redraw pump. No-op when the row is gone (e.g. after restart).
+fn set_send_status(client_id: i64, status: SendStatus) {
+    BRIDGE.with(|b| {
+        let borrowed = b.borrow();
+        let Some((model, _)) = borrowed.as_ref() else {
+            return;
+        };
+        let mut i = 0;
+        while i < model.row_count() {
+            match model.row_data(i) {
+                Some(mut m) if m.uid as i64 == client_id => {
+                    m.status = status;
+                    model.set_row_data(i, m);
+                    return;
+                }
+                Some(_) => i += 1,
+                None => return,
+            }
+        }
+    });
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     let ui = MainWindow::new()?;
 
@@ -314,6 +343,9 @@ fn main() -> Result<(), slint::PlatformError> {
             },
             grouped,
             uid,
+            // Demo rows are never send-tracked.
+            client_id: 0,
+            status: SendStatus::Sent,
         });
         last = Some(((*author).to_string(), *min));
     }
@@ -394,6 +426,20 @@ fn main() -> Result<(), slint::PlatformError> {
                                 ui.set_channels(Rc::new(VecModel::from(rows)).into());
                                 ui.set_selected(first);
                             }
+                            // Send retry bookkeeping: route the outcome back
+                            // to the row that sent it (uid == client_id).
+                            onebot::Event::SendOk {
+                                client_id,
+                                message_id,
+                            } => {
+                                eprintln!(
+                                    "gugu: send ok for row {client_id} (message_id {message_id})"
+                                );
+                                set_send_status(client_id, SendStatus::Sent);
+                            }
+                            onebot::Event::SendFailed { client_id } => {
+                                set_send_status(client_id, SendStatus::Failed);
+                            }
                         }
                     });
                 }),
@@ -411,6 +457,9 @@ fn main() -> Result<(), slint::PlatformError> {
         if draft.trim().is_empty() {
             return;
         }
+        // One uid per outgoing row doubles as the retry machinery's
+        // client_id, so SendOk/SendFailed route straight back to this row.
+        let send_uid = next_uid();
         // T5 addressing: the selected sidebar row carries the peer id. Header
         // rows (peer_id ""), unparseable ids and demo mode echo locally only.
         let target = ui
@@ -420,11 +469,13 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Ok(peer_id) = ch.peer_id.parse::<i64>() {
                 ob.send(if ch.is_group {
                     onebot::Action::SendGroup {
+                        client_id: send_uid as i64,
                         group_id: peer_id,
                         text: draft.clone(),
                     }
                 } else {
                     onebot::Action::SendPrivate {
+                        client_id: send_uid as i64,
                         user_id: peer_id,
                         text: draft.clone(),
                     }
@@ -444,7 +495,9 @@ fn main() -> Result<(), slint::PlatformError> {
             color: color_of("you"),
             sticker: slint::Image::default(),
             grouped,
-            uid: next_uid(),
+            uid: send_uid,
+            client_id: send_uid,
+            status: SendStatus::Sent,
         });
         *last_send.borrow_mut() = Some(("you".to_string(), min));
         ui.set_draft("".into());
@@ -521,6 +574,10 @@ fn main() -> Result<(), slint::PlatformError> {
             sticker: frames.frames.first().cloned().unwrap_or_default(),
             grouped,
             uid,
+            // Local sticker picks are never send-tracked (image channel is
+            // batch seven; once it ships, picked stickers go through it).
+            client_id: 0,
+            status: SendStatus::Sent,
         });
         *last_pick.borrow_mut() = Some(("you".to_string(), min));
         // A static (single-frame) sticker has nothing to animate.
