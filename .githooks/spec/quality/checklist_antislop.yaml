@@ -1,0 +1,34 @@
+# CK-ANTISLOP: AI slop 专项检查 — 单二进制 antislop 做 5 类规则
+# 依据: antislop (crates.io, github.com/skew202/antislop) — hybrid regex+AST, 毫秒级
+# 检测: Placeholder(TODO/FIXME) / Deferral(for now/temporary fix) / Hedging(hopefully/should work)
+#       / Stub(空实现) / NamingConvention — MECE 哲学: 与 clippy/eslint 正交互补, 不重复抓
+# 依赖: cargo install antislop。缺失时 harness 输出 [] 走 optional 静默跳过(不假绿, 不阻断)
+# 协议: mode:grep — harness 自扫仓库根, jq 把 antislop JSON 适配成 gate finding 数组
+# 注: --extensions 按需调; --only/--disable 可门控规则类(全部进 yaml 参数域)
+enabled: true
+hooks: [pre-commit, pre-push, merge]
+sla: l1
+fail_severity: WARN
+mode: grep
+match:
+  paths_include: ["**/*.rs", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.py", "**/*.go"]
+  paths_exclude: ["target/", ".wt/", "node_modules/"]
+harness:
+  command: "sh"
+  args:
+    - "-c"
+    - |
+      ROOT=$(git rev-parse --show-toplevel)
+      command -v antislop >/dev/null 2>&1 || { echo '[]'; exit 0; }
+      antislop "$ROOT" --format json --extensions rs,ts,tsx,js,py,go 2>/dev/null \
+        | jq '[.findings[] | {
+                id: .category,
+                severity: (if .severity == "HIGH" then "FAIL"
+                           elif .severity == "MEDIUM" then "WARN"
+                           else "INFO" end),
+                path: .file,
+                line: .line,
+                message: .message
+              }]'
+optional: true
+timeout: 60
