@@ -7,6 +7,11 @@ ignore_paths:
   - ".git/"
   - ".benchmarks/"
   - ".pytest_cache/"
+  - ".venv/"
+  - ".ruff_cache/"
+  - ".mypy_cache/"
+  - ".agent/"
+  - "todo/"
 orphan_patterns:
   - "tmp/"
   - "__pycache__/"

@@ -11,41 +11,15 @@ fail_severity: WARN
 match:
   paths_include: ["**/*.rs"]
   paths_exclude: ["target/", ".wt/", "**/tests/**", "**/test_*.rs"]
-mode: grep
+mode: file
 harness:
-  command: "sh"
+  command: "python3"
   args:
-    - "-c"
-    - |
-      ROOT=$(git rev-parse --show-toplevel)
-      # 提取 4+ 连续非空行的块 (排除单行注释/单行 use 等短行)
-      # 用 awk 标记每个文件的 4-行块, sort+uniq 找跨文件重复
-      matches=$(find "$ROOT" -name "*.rs" \
-        -not -path "*/target/*" -not -path "*/.wt/*" -not -path "*/.git/*" \
-        -not -path "*/tests/*" 2>/dev/null \
-        | xargs awk '
-        BEGIN { block=""; count=0; file=FILENAME }
-        /^[[:space:]]*$/ { if (count >= 4 && length(block) > 80) print file ":" block "<<<CLONE>>>"; block=""; count=0; next }
-        { if (block == "") file=FILENAME; block = block "\n" $0; count++ }
-        ' 2>/dev/null \
-        | sort -t'<' -k4 \
-        | awk -F'<<<CLONE>>>' '
-        { n=split($1, a, ":"); file=a[1]; code=$2; if (file != prev_file) { if (count > 1) print prev_file " <-> " file " : " code; prev_file=file; count=1 } else { count++ } }
-        END { if (count > 1) print "duplicate block in " prev_file " appears " count+1 " times" }
-        ' | head -10)
-      if [ -z "$matches" ]; then
-        echo '[]'
-      else
-        printf '%s' "$matches" | jq -R -s '
-          split("\n") | map(select(length > 0))
-          | map(capture("^(?<rest>.*)$"))
-          | map({
-              id: "DUPLICATE-CODE",
-              severity: "WARN",
-              path: ".",
-              line: 0,
-              message: ("复制代码块 (>=4 连续行): " + .rest)
-            })'
-      fi
-optional: true
+    - ".githooks/spec/harness/verify_chain.py"
+    - "--rule"
+    - "duplication"
+  # 候选 = 4+ 连续非空行块(>80字符) md5 在本次变更文件集中重复; 判决 = jev noul '真漂移 vs 惯用相似'
+  # 范围 = 本次变更（抓新引入的复制漂移）; 无 key / 请求失败 -> 候选降级 WARN
+optional:
+ true
 timeout: 30

@@ -6,29 +6,18 @@
 # 协议: mode:grep — harness 自扫仓库根, jq 把 antislop JSON 适配成 gate finding 数组
 # 注: --extensions 按需调; --only/--disable 可门控规则类(全部进 yaml 参数域)
 enabled: true
-hooks: [pre-commit, pre-push, merge]
-sla: l1
+hooks: [merge]
+sla: l2
 fail_severity: WARN
-mode: grep
-match:
-  paths_include: ["**/*.rs", "**/*.ts", "**/*.tsx", "**/*.js", "**/*.py", "**/*.go"]
-  paths_exclude: ["target/", ".wt/", "node_modules/"]
+mode: file
 harness:
-  command: "sh"
+  command: "python3"
   args:
-    - "-c"
-    - |
-      ROOT=$(git rev-parse --show-toplevel)
-      command -v antislop >/dev/null 2>&1 || { echo '[]'; exit 0; }
-      antislop "$ROOT" --format json --extensions rs,ts,tsx,js,py,go 2>/dev/null \
-        | jq '[.findings[] | {
-                id: .category,
-                severity: (if .severity == "HIGH" then "FAIL"
-                           elif .severity == "MEDIUM" then "WARN"
-                           else "INFO" end),
-                path: .file,
-                line: .line,
-                message: .message
-              }]'
-optional: true
+    - ".githooks/spec/harness/verify_chain.py"
+    - "--rule"
+    - "antislop"
+  # 候选 = 五类词法正则（高召回）; 判决 = jev noul '真 slop vs 合法用法' + score 严重度
+  # 无 key / 请求失败 -> 候选降级为 WARN 原样输出（召回不丢，处置照常）
+optional:
+ true
 timeout: 60

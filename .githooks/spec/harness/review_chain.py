@@ -10,9 +10,10 @@ Tier order (first available wins):
 
 Per-question thresholds (confidence-gated routing): each question may carry
 "fail"/"warn" floats in the questions JSON; absent → harness defaults.
-    p(issue) >= fail -> FAIL   (hard block)
-    p(issue) >= warn -> WARN   (advisory)
-    otherwise        -> INFO   (confidence carried for the dev agent)
+    p(issue) >= fail -> FAIL   (hard block: must fix or split before push)
+    p(issue) >= warn -> WARN   (must be dispositioned: fix, or written rejection
+                                 with evidence recorded in the PR review log)
+    otherwise        -> INFO   (confidence carried; batchable backlog, no per-item disposition)
 
 Gate protocol: stdin = diff (mode: diff); stdout = findings JSON array with
 extras {tier, confidence, question}. Any infra failure (no key / network /
@@ -54,7 +55,9 @@ def finding(qid: str, p: float, fail: float, warn: float, tier: str, instruction
         "message": (
             f"{tier}: {qid} p(issue)={p:.2f} "
             f"(fail>={fail}, warn>={warn}) — "
-            + ("BLOCK: fix or split before push" if sev == "FAIL" else "confidence for dev agent")
+            + ("BLOCK: fix or split before push" if sev == "FAIL"
+               else "DISPOSITION REQUIRED: fix this, or record a written rejection with evidence in the PR review log (silent skip = violation)" if sev == "WARN"
+               else "reference only; fold into backlog, no per-item disposition needed")
         ),
         "tier": tier,
         "confidence": f"{p:.2f}",
