@@ -221,8 +221,9 @@
 - 全量测试、全量构建、全量 lint 放 CI 或收尾阶段，不在改动过程中反复跑。
 - 本地只跑轻量、快的针对性检查（单 crate `cargo check`、单包测试、`fmt --check`、
   类型检查）。
-- 需要本地跑重命令时，套资源限制（`systemd-run --user --scope -p CPUQuota=65% --` 或本仓等价手段），
-  不抢占用户正在用的 CPU。
+- 需要本地跑重命令时，套 cgroup CPU 配额（`systemd-run --user --scope -p CPUQuota=70% --`
+  或本仓等价手段），不抢占用户正在用的 CPU——与「Rust 开发性能」章节同值，
+  两处不要各写一个数。
 - 装依赖、打包等命令同样受限。
 
 ### 收尾
