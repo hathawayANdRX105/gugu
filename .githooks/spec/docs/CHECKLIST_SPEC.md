@@ -6,7 +6,7 @@
 
 - **零硬编码检查项**：每条检查 = 一份 yaml，gate 不懂检查含义。
 - **harness 任意**：claude / 9router / vLLM / 本地 sh 都行，gate 只调 `argv/stdin → stdout`。
-- **复用 finding 协议**：跟 `code.rs` / `ocr` / `code-review-graph` 同一种 `Finding { id, severity, path, line, message }` 结构，统一走 gate 的 FAIL/WARN/INFO 出口。
+- **复用 finding 协议**：跟 `code.rs` 同一种 `Finding { id, severity, path, line, message }` 结构，统一走 gate 的 FAIL/WARN/INFO 出口。
 - **可拓展**：加检查 = 加 yaml，gate 不需要重新发版。
 
 ## 文件位置与发现
@@ -149,7 +149,7 @@ gate 根据 `mode` 给 harness 三种输入之一：
    **`.gitignore` 就是排除配置**：目录被 gitignore 即自动出扫描集；按规则细化排除在文件列表上
    `grep -zvE '(^|/)xx/'`（或 pathspec `:(exclude)...`）。
 
-2. **不写死目录层级**（`crates/*/src` 等 omenic 专属布局）：`git ls-files` 输出仓库根相对路径，
+2. **不写死目录层级**（`crates/*/src` 等 kymido 专属布局）：`git ls-files` 输出仓库根相对路径，
    硬编码布局在别的仓库静默扫 0 文件、假绿（比报错更危险）。
 
 3. **跨语言测试文件命名一并排除**（`tests/` 目录挡不住同目录 `*_test.go` / `test_*.py` /
@@ -180,7 +180,7 @@ merge:
   - github/pull_requests
   - github/reviews
   - cleanup
-  - checklist      # 新增（手动 gate merge 时全跑）
+  - checklist      # 新增（手动 canon merge 时全跑）
 ```
 
 checklist 自身再用 `hooks:` 字段过滤；topic 进来后**每个 yaml 独立判断**是否在本钩子触发。
@@ -242,7 +242,7 @@ timeout: 60
 
 跑起来（mock harness 时）：
 ```
-$ gate pre-push
+$ canon pre-push
 [checklist.file_placement_demo] file_placement_demo.FP-01 WARN crates/page/admin/src/network.rs 2952 lines exceeds 1500
 ```
 
@@ -282,11 +282,11 @@ timeout: 30
 ## 迁移路径
 
 1. 加 `crates/spec/src/tools/checklist.rs`（~120 行）
-2. `bin/gate/src/main.rs` 在 PreCommit/PrePush/Merge 路径里调 `run_all`
+2. `src/main.rs` 在 PreCommit/PrePush/Merge 路径里调 `run_all`
 3. `.githooks/spec/dispatch.yaml` 加 `checklist` topic
 4. `.githooks/spec/SPEC_OVERVIEW.md` 加「主题九：Checklist（CK-01）」章节
 5. demo yaml + mock harness 脚本（不需真调 LLM；echo mock JSON 即可）
-6. `ferrite` 加 `.githooks/` + `gate init` → 跑 `gate pre-push` 验证
+6. `ferrite` 加 `.githooks/` + `canon init` → 跑 `canon pre-push` 验证
 
 ## 不做的事（YAGNI）
 
