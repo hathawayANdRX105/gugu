@@ -12,3 +12,6 @@ data/*
 .code-review-graph/
 node_modules/
 .testless/
+
+# 开发工作树（git worktree），见 AGENTS.md「开发方式」
+.wt/
