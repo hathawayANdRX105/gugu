@@ -31,6 +31,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      # 仓级 .cargo/config.toml 设 build.rustc-wrapper="sccache"（跨 worktree
+      # 编译缓存，见该文件注释），runner 默认无 sccache 会直接 build 失败。
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
       - run: cargo fmt --all --check
 
   clippy:
@@ -41,6 +45,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # 仓级 .cargo/config.toml 设 build.rustc-wrapper="sccache"（跨 worktree
+      # 编译缓存，见该文件注释），runner 默认无 sccache 会直接 build 失败。
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install system deps (Slint winit/X11)
         run: |
           sudo apt-get update
@@ -58,6 +66,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # 仓级 .cargo/config.toml 设 build.rustc-wrapper="sccache"（跨 worktree
+      # 编译缓存，见该文件注释），runner 默认无 sccache 会直接 build 失败。
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install system deps (Slint winit/X11)
         run: |
           sudo apt-get update
@@ -75,6 +87,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # 仓级 .cargo/config.toml 设 build.rustc-wrapper="sccache"（跨 worktree
+      # 编译缓存，见该文件注释），runner 默认无 sccache 会直接 build 失败。
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
       - name: Install system deps (Slint winit/X11)
         run: |
           sudo apt-get update
