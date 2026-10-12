@@ -63,8 +63,9 @@
 
 #### CPU 配额（硬约束）
 
-- CPU-heavy 命令必须套 `systemd-run --user --scope -p CPUQuota=70% --`：`cargo build` / `cargo test` /
+- CPU-heavy 命令必须套 `.githooks/heavy`：`cargo build` / `cargo test` /
   `cargo clippy` / `npm` 等；`git`、`grep`、文件读写等轻量命令不需要。
+  （CPUQuota 百分比是**单核**百分比，不是整机——写死 70% 在 8 核上只有 0.7 核；`heavy` 按 `nproc` 的一半现算，理由见 `.githooks/heavy` 头注）
 
 #### 测试分层
 
@@ -194,7 +195,7 @@
   测试；testless 异常/零命中自动降级全量，绝不静默跳过。全量务必
   `cargo test --workspace`（根包 workspace 下裸 `cargo test` 只跑根包）。
 - 不要在会话里自行 `export RUSTC_WRAPPER` 或改 jobs——统一走仓配置；
-  重命令照旧套 cgroup CPU 配额（`systemd-run --user --scope -p CPUQuota=70% --`）。
+  重命令照旧套 cgroup CPU 配额（`.githooks/heavy`）。
 - 增量编译已关（缓存优先）：同树连续小改动按 crate 级重编是预期行为，不是
   回归；若本仓热重载明显变慢，提 issue 议局部放开。
 - 新建 `.wt` worktree 直接用；旧布局 worktree 若报 workspace 收编错误，
@@ -221,9 +222,10 @@
 - 全量测试、全量构建、全量 lint 放 CI 或收尾阶段，不在改动过程中反复跑。
 - 本地只跑轻量、快的针对性检查（单 crate `cargo check`、单包测试、`fmt --check`、
   类型检查）。
-- 需要本地跑重命令时，套 cgroup CPU 配额（`systemd-run --user --scope -p CPUQuota=70% --`
+- 需要本地跑重命令时，套 cgroup CPU 配额（`.githooks/heavy`
   或本仓等价手段），不抢占用户正在用的 CPU——与「Rust 开发性能」章节同值，
   两处不要各写一个数。
+  （CPUQuota 百分比是**单核**百分比，不是整机——写死 70% 在 8 核上只有 0.7 核；`heavy` 按 `nproc` 的一半现算，理由见 `.githooks/heavy` 头注）
 - 本条是**默认下限**：本仓 local 约定更严格时以 local 为准（如本项目禁止本地跑
   任何编译/测试、只准 CI 跑，比套配额更严），此时本条自动让位，不构成豁免。
 - 装依赖、打包等命令同样受限。
